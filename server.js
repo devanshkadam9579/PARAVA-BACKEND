@@ -6,8 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import Razorpay from 'razorpay';
-import { initializeApp } from 'firebase/app';
-import { getFirestore, collection, doc, setDoc, deleteDoc, getDocs, getDoc, query, where, limit } from 'firebase/firestore';
+import admin from 'firebase-admin';
 import { DEFAULT_CATEGORIES, DEFAULT_PROMOS, DEFAULT_VENDORS } from './seedData.js';
 
 dotenv.config();
@@ -15,17 +14,31 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Read Firebase client config from parent directory
-const configPath = path.resolve(__dirname, './firebase-applet-config.json');
-if (!fs.existsSync(configPath)) {
-  console.error(`Firebase config file not found at: ${configPath}`);
-  process.exit(1);
-}
-const firebaseConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+// Initialize Firebase Admin SDK
+let serviceAccount;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  } else {
+    const serviceAccountPath = path.resolve(__dirname, './serviceAccountKey.json');
+    if (fs.existsSync(serviceAccountPath)) {
+      serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, 'utf8'));
+    }
+  }
 
-// Initialize Firebase client
-const firebaseApp = initializeApp(firebaseConfig);
-const db = getFirestore(firebaseApp);
+  if (serviceAccount) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log("Firebase Admin SDK initialized successfully.");
+  } else {
+    console.warn("WARNING: Firebase Admin not initialized. Missing FIREBASE_SERVICE_ACCOUNT_JSON in environment variables or serviceAccountKey.json locally.");
+  }
+} catch (error) {
+  console.error("Firebase Admin Initialization Error:", error);
+}
+
+const db = admin.apps.length > 0 ? admin.firestore() : null;
 
 // Initialize Razorpay SDK
 const razorpay = new Razorpay({
@@ -38,6 +51,14 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
+
+// Middleware to check DB
+app.use((req, res, next) => {
+  if (!db && req.path.startsWith('/api/')) {
+    return res.status(500).json({ error: 'Database not initialized. Missing Service Account.' });
+  }
+  next();
+});
 
 // 1. PAYMENT ROUTES
 app.post('/api/payments/initiate', async (req, res) => {
@@ -115,8 +136,6 @@ app.post('/api/payments/verify', async (req, res) => {
 
     // Save transaction to Firestore
     const transactionId = `txn_${Date.now()}`;
-    const txnRef = doc(db, 'transactions', transactionId);
-    
     const transactionData = {
       id: transactionId,
       userId: userId || 'Guest',
@@ -132,13 +151,12 @@ app.post('/api/payments/verify', async (req, res) => {
       timestamp: new Date().toISOString()
     };
     
-    await setDoc(txnRef, transactionData);
+    await db.collection('transactions').doc(transactionId).set(transactionData);
 
     // If it's a connection unlock, record it in connections collection to gate chat access
     if (type === 'connection' && userId && vendorId) {
       const connId = `${userId}_${vendorId}`;
-      const connRef = doc(db, 'connections', connId);
-      await setDoc(connRef, {
+      await db.collection('connections').doc(connId).set({
         id: connId,
         userId,
         vendorId,
@@ -158,19 +176,19 @@ app.post('/api/payments/verify', async (req, res) => {
 app.get('/api/admin/dashboard', async (req, res) => {
   try {
     // Fetch users count
-    const usersSnap = await getDocs(collection(db, 'users'));
+    const usersSnap = await db.collection('users').get();
     const totalUsers = usersSnap.size;
 
     // Fetch vendors count
-    const vendorsSnap = await getDocs(collection(db, 'vendors'));
+    const vendorsSnap = await db.collection('vendors').get();
     const totalVendors = vendorsSnap.size;
 
     // Fetch bookings count
-    const bookingsSnap = await getDocs(collection(db, 'bookings'));
+    const bookingsSnap = await db.collection('bookings').get();
     const totalBookings = bookingsSnap.size;
 
     // Fetch transaction totals
-    const txnsSnap = await getDocs(collection(db, 'transactions'));
+    const txnsSnap = await db.collection('transactions').get();
     let totalRevenue = 0;
     let totalGST = 0;
     let totalCommission = 0;
@@ -216,42 +234,42 @@ app.get('/api/admin/dashboard', async (req, res) => {
 app.post('/api/admin/reset-defaults', async (req, res) => {
   try {
     // 1. Delete all categories and write defaults
-    const categoriesSnap = await getDocs(collection(db, 'categories'));
+    const categoriesSnap = await db.collection('categories').get();
     for (const docSnap of categoriesSnap.docs) {
-      await deleteDoc(doc(db, 'categories', docSnap.id));
+      await db.collection('categories').doc(docSnap.id).delete();
     }
     for (const cat of DEFAULT_CATEGORIES) {
-      await setDoc(doc(db, 'categories', cat.id), cat);
+      await db.collection('categories').doc(cat.id).set(cat);
     }
 
     // 2. Delete all promos and write defaults
-    const promosSnap = await getDocs(collection(db, 'promos'));
+    const promosSnap = await db.collection('promos').get();
     for (const docSnap of promosSnap.docs) {
-      await deleteDoc(doc(db, 'promos', docSnap.id));
+      await db.collection('promos').doc(docSnap.id).delete();
     }
     for (const promo of DEFAULT_PROMOS) {
-      await setDoc(doc(db, 'promos', promo.id), promo);
+      await db.collection('promos').doc(promo.id).set(promo);
     }
 
     // 3. Delete all vendors and write defaults
-    const vendorsSnap = await getDocs(collection(db, 'vendors'));
+    const vendorsSnap = await db.collection('vendors').get();
     for (const docSnap of vendorsSnap.docs) {
-      await deleteDoc(doc(db, 'vendors', docSnap.id));
+      await db.collection('vendors').doc(docSnap.id).delete();
     }
     for (const vendor of DEFAULT_VENDORS) {
-      await setDoc(doc(db, 'vendors', vendor.id), vendor);
+      await db.collection('vendors').doc(vendor.id).set(vendor);
     }
 
     // 4. Optionally clear transactions
-    const txnsSnap = await getDocs(collection(db, 'transactions'));
+    const txnsSnap = await db.collection('transactions').get();
     for (const docSnap of txnsSnap.docs) {
-      await deleteDoc(doc(db, 'transactions', docSnap.id));
+      await db.collection('transactions').doc(docSnap.id).delete();
     }
 
     // 5. Optionally clear connections
-    const connsSnap = await getDocs(collection(db, 'connections'));
+    const connsSnap = await db.collection('connections').get();
     for (const docSnap of connsSnap.docs) {
-      await deleteDoc(doc(db, 'connections', docSnap.id));
+      await db.collection('connections').doc(docSnap.id).delete();
     }
 
     res.json({
