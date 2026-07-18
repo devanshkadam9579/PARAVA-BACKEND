@@ -38,7 +38,12 @@ try {
   console.error("Firebase Admin Initialization Error:", error);
 }
 
-const db = admin.apps.length > 0 ? admin.firestore() : null;
+import { getFirestore } from 'firebase-admin/firestore';
+import config from './firebase-applet-config.json' assert { type: "json" };
+
+const db = admin.apps.length > 0 
+  ? (config.firestoreDatabaseId ? getFirestore(admin.apps[0], config.firestoreDatabaseId) : admin.firestore())
+  : null;
 
 // Initialize Razorpay SDK
 const razorpay = new Razorpay({
