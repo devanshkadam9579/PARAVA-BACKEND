@@ -181,6 +181,31 @@ app.post('/api/payments/verify', async (req, res) => {
   }
 });
 
+// Secure endpoint to sync master admin to users collection (bypassing client rules)
+app.post('/api/admin/sync-user', async (req, res) => {
+  try {
+    const { uid, email, name } = req.body;
+    const adminEmails = ['devenshkadam2@gmail.com', 'devanshkadam2@gmail.com'];
+    
+    if (adminEmails.includes(email)) {
+      if (db) {
+        await db.collection('users').doc(uid).set({
+          uid,
+          email,
+          name,
+          role: 'master_admin',
+          city: 'Mumbai'
+        }, { merge: true });
+      }
+      return res.json({ success: true });
+    }
+    return res.status(403).json({ success: false, error: 'Not authorized' });
+  } catch (err) {
+    console.error("Sync User Error:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // 2. ADMIN DASHBOARD STATS ROUTE
 app.get('/api/admin/dashboard', async (req, res) => {
   try {
