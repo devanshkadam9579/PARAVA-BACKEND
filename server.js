@@ -206,6 +206,17 @@ app.post('/api/admin/sync-user', async (req, res) => {
   }
 });
 
+// TEMPORARY DEBUG ENDPOINT
+app.get('/api/admin/debug-users', async (req, res) => {
+  try {
+    const snap = await db.collection('users').get();
+    const users = snap.docs.map(d => d.data());
+    res.json({ success: true, users });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
 // 2. ADMIN DASHBOARD STATS ROUTE
 app.get('/api/admin/dashboard', async (req, res) => {
   try {
