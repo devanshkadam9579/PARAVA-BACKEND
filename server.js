@@ -52,6 +52,10 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
 
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', message: 'PARVA Backend is running successfully!' });
+});
+
 // Middleware to check DB
 app.use((req, res, next) => {
   if (!db && req.path.startsWith('/api/')) {
