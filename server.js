@@ -39,7 +39,7 @@ try {
 }
 
 import { getFirestore } from 'firebase-admin/firestore';
-import config from './firebase-applet-config.json' assert { type: "json" };
+import config from './firebase-applet-config.json' with { type: "json" };
 
 const db = admin.apps.length > 0 
   ? (config.firestoreDatabaseId ? getFirestore(admin.apps[0], config.firestoreDatabaseId) : admin.firestore())
