@@ -278,6 +278,51 @@ app.get('/api/admin/dashboard', async (req, res) => {
   }
 });
 
+// Admin Category Management Endpoints (Admin SDK bypasses client security rules)
+app.post('/api/admin/categories', async (req, res) => {
+  try {
+    const { id, name, icon, iconName, image } = req.body;
+    if (!id || !name) {
+      return res.status(400).json({ success: false, error: 'Category ID and Name are required.' });
+    }
+    const catData = {
+      id,
+      name,
+      icon: icon || 'Sparkles',
+      iconName: iconName || icon || 'Sparkles',
+      image: image || 'https://images.unsplash.com/photo-1519167758481-83f550bb49b3?auto=format&fit=crop&q=80&w=400'
+    };
+    await db.collection('categories').doc(id).set(catData, { merge: true });
+    res.json({ success: true, category: catData });
+  } catch (error) {
+    console.error('Admin Add Category Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/admin/categories/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.collection('categories').doc(id).delete();
+    res.json({ success: true, message: `Category ${id} deleted successfully.` });
+  } catch (error) {
+    console.error('Admin Delete Category Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Admin Settings Management Endpoint
+app.post('/api/admin/settings', async (req, res) => {
+  try {
+    const { docId = 'global', data } = req.body;
+    await db.collection('settings').doc(docId).set(data, { merge: true });
+    res.json({ success: true, message: 'Settings saved successfully.' });
+  } catch (error) {
+    console.error('Admin Save Settings Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // 3. ADMIN RESET TO DEFAULTS ROUTE
 app.post('/api/admin/reset-defaults', async (req, res) => {
   try {
