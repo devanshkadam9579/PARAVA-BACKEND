@@ -14,6 +14,9 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+import config from './firebase-applet-config.json' with { type: "json" };
+import { getFirestore } from 'firebase-admin/firestore';
+
 // Initialize Firebase Admin SDK
 let serviceAccount;
 try {
@@ -30,16 +33,16 @@ try {
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
     });
-    console.log("Firebase Admin SDK initialized successfully.");
+    console.log("Firebase Admin SDK initialized successfully with Service Account.");
   } else {
-    console.warn("WARNING: Firebase Admin not initialized. Missing FIREBASE_SERVICE_ACCOUNT_JSON in environment variables or serviceAccountKey.json locally.");
+    console.warn("WARNING: Service Account credential not found. Initializing Firebase Admin with config projectId fallback:", config.projectId);
+    admin.initializeApp({
+      projectId: config.projectId
+    });
   }
 } catch (error) {
   console.error("Firebase Admin Initialization Error:", error);
 }
-
-import { getFirestore } from 'firebase-admin/firestore';
-import config from './firebase-applet-config.json' with { type: "json" };
 
 const db = admin.apps.length > 0 
   ? (config.firestoreDatabaseId ? getFirestore(admin.apps[0], config.firestoreDatabaseId) : admin.firestore())
