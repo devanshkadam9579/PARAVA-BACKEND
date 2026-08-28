@@ -8,6 +8,15 @@ import crypto from 'crypto';
 import Razorpay from 'razorpay';
 import admin from 'firebase-admin';
 import { DEFAULT_CATEGORIES, DEFAULT_PROMOS, DEFAULT_VENDORS } from './seedData.js';
+import { generateBookingPdf } from './services/pdfService.js';
+import { calculateVendorCommission } from './services/commissionService.js';
+import {
+  sendBookingCreatedEmail,
+  sendPaymentAndBookingConfirmedEmails,
+  sendBookingCancellationEmail,
+  sendRefundProcessedEmail,
+  sendIdempotentEmail
+} from './services/emailService.js';
 
 dotenv.config();
 
@@ -61,7 +70,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 5000;
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'PARVA Backend is running successfully!' });
+  res.json({ status: 'ok', message: 'PARVA Celebrations Backend & Resend Email Automation Engine is Active!' });
 });
 
 // Middleware to check DB
@@ -72,7 +81,8 @@ app.use((req, res, next) => {
   next();
 });
 
-// 1. PAYMENT ROUTES
+// ==================== 1. PAYMENT & VERIFICATION ROUTES ====================
+
 app.post('/api/payments/initiate', async (req, res) => {
   try {
     const { userId, vendorId, type, amount } = req.body;
@@ -84,20 +94,35 @@ app.post('/api/payments/initiate', async (req, res) => {
     let total = 0;
 
     if (type === 'connection') {
-      connectionFee = 499; // Flat connection fee to unlock chat
+      connectionFee = 499;
       gstAmount = Math.round(connectionFee * 0.18 * 100) / 100;
       total = connectionFee + gstAmount;
     } else if (type === 'booking') {
       subtotal = Number(amount) || 0;
-      commissionAmount = Math.round(subtotal * 0.01 * 100) / 100; // 1% commission on vendor booking value
-      gstAmount = Math.round(commissionAmount * 0.18 * 100) / 100; // 18% GST on commission
-      total = commissionAmount + gstAmount;
+      
+      // Fetch dynamic commission settings from Admin settings
+      let commissionPct = 10;
+      if (db) {
+        try {
+          const settingsDoc = await db.collection('settings').doc('global').get();
+          if (settingsDoc.exists && settingsDoc.data().commissionPercentage) {
+            commissionPct = Number(settingsDoc.data().commissionPercentage);
+          }
+        } catch (e) {
+          console.warn("Could not fetch commission settings, defaulting to 10%:", e);
+        }
+      }
+
+      const commissionData = calculateVendorCommission(subtotal, { commissionPercentage: commissionPct });
+      commissionAmount = commissionData.platformCommission;
+      gstAmount = commissionData.gstOnCommission;
+      total = subtotal; // Customer pays the booking amount
     } else {
       return res.status(400).json({ error: 'Invalid payment type requested.' });
     }
 
     const options = {
-      amount: Math.round(total * 100), // Razorpay accepts in paise
+      amount: Math.round(total * 100),
       currency: "INR",
       receipt: `receipt_${Date.now()}`
     };
@@ -129,10 +154,9 @@ app.post('/api/payments/verify', async (req, res) => {
       userId,
       vendorId,
       type,
-      commissionAmount,
-      gstAmount,
-      connectionFee,
-      totalAmount
+      totalAmount,
+      bookingData,
+      customerData
     } = req.body;
 
     // Validate Signature
@@ -146,45 +170,339 @@ app.post('/api/payments/verify', async (req, res) => {
       return res.status(400).json({ error: "Invalid payment signature." });
     }
 
-    // Save transaction to Firestore
+    // Fetch dynamic commission settings
+    let commissionPct = 10;
+    let termsVersion = '1.2';
+    if (db) {
+      try {
+        const settingsDoc = await db.collection('settings').doc('global').get();
+        if (settingsDoc.exists) {
+          const sData = settingsDoc.data();
+          if (sData.commissionPercentage) commissionPct = Number(sData.commissionPercentage);
+          if (sData.termsVersion) termsVersion = sData.termsVersion;
+        }
+      } catch (e) { }
+    }
+
+    const commissionData = calculateVendorCommission(Number(totalAmount) || 0, { commissionPercentage: commissionPct });
+
+    // Save transaction
     const transactionId = `txn_${Date.now()}`;
     const transactionData = {
       id: transactionId,
       userId: userId || 'Guest',
       vendorId: vendorId || 'System',
-      type: type || 'connection',
+      type: type || 'booking',
       orderId: razorpay_order_id,
       paymentId: razorpay_payment_id,
-      commissionAmount: Number(commissionAmount) || 0,
-      gstAmount: Number(gstAmount) || 0,
-      connectionFee: Number(connectionFee) || 0,
       totalAmount: Number(totalAmount) || 0,
+      platformCommission: commissionData.platformCommission,
+      gstOnCommission: commissionData.gstOnCommission,
+      vendorPayout: commissionData.vendorPayout,
       status: 'Paid',
+      termsVersion,
+      termsAcceptedAt: new Date().toISOString(),
       timestamp: new Date().toISOString()
     };
     
     await db.collection('transactions').doc(transactionId).set(transactionData);
 
-    // If it's a connection unlock, record it in connections collection to gate chat access
-    if (type === 'connection' && userId && vendorId) {
-      const connId = `${userId}_${vendorId}`;
-      await db.collection('connections').doc(connId).set({
-        id: connId,
-        userId,
-        vendorId,
-        unlocked: true,
-        timestamp: new Date().toISOString()
+    // If it's a booking, update status & trigger confirmation workflows
+    let confirmedBooking = null;
+    if (type === 'booking' && bookingData) {
+      const bookingId = bookingData.id || `b_${Date.now()}`;
+      confirmedBooking = {
+        ...bookingData,
+        id: bookingId,
+        paymentStatus: 'Paid',
+        status: 'Confirmed',
+        transactionId,
+        paymentId: razorpay_payment_id,
+        orderId: razorpay_order_id,
+        commissionBreakdown: commissionData,
+        termsVersion,
+        termsAcceptedAt: new Date().toISOString(),
+        confirmedAt: new Date().toISOString()
+      };
+
+      await db.collection('bookings').doc(bookingId).set(confirmedBooking, { merge: true });
+
+      // Create Lead record
+      const leadId = `lead_${Date.now()}`;
+      await db.collection('leads').doc(leadId).set({
+        id: leadId,
+        bookingId,
+        vendorId: bookingData.vendor?.id || vendorId,
+        vendorName: bookingData.vendor?.name || 'Event Partner',
+        customerName: customerData?.name || bookingData.customerName || 'Valued Customer',
+        customerPhone: customerData?.phone || bookingData.customerPhone || 'N/A',
+        customerEmail: customerData?.email || bookingData.customerEmail || 'N/A',
+        eventDate: bookingData.eventDate,
+        eventType: bookingData.eventType || 'Celebration',
+        amount: Number(totalAmount) || 0,
+        status: 'Confirmed & Paid',
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      // Generate Official Confirmation & Invoice PDF
+      let pdfBuffer = null;
+      try {
+        pdfBuffer = await generateBookingPdf({
+          bookingId,
+          customerName: customerData?.name || bookingData.customerName || 'Valued Customer',
+          customerPhone: customerData?.phone || bookingData.customerPhone || 'N/A',
+          customerEmail: customerData?.email || bookingData.customerEmail || 'N/A',
+          vendorName: bookingData.vendor?.name || 'Event Partner',
+          vendorCategory: bookingData.vendor?.category || 'Event Services',
+          vendorLocation: bookingData.vendor?.location || 'Maharashtra',
+          serviceName: bookingData.selectedServices?.[0]?.name || bookingData.vendor?.category || 'Event Package',
+          eventDate: bookingData.eventDate,
+          eventType: bookingData.eventType,
+          totalAmount: Number(totalAmount) || 0,
+          amountPaid: Number(totalAmount) || 0,
+          paymentStatus: 'Paid',
+          paymentId: razorpay_payment_id,
+          orderId: razorpay_order_id,
+          termsVersion,
+          termsAcceptedAt: new Date().toISOString()
+        });
+      } catch (pdfErr) {
+        console.error("Error generating booking PDF:", pdfErr);
+      }
+
+      // Backend Triggers Automated Emails via Resend
+      const customer = {
+        name: customerData?.name || bookingData.customerName || 'Valued Customer',
+        email: customerData?.email || bookingData.customerEmail,
+        phone: customerData?.phone || bookingData.customerPhone
+      };
+
+      const vendor = {
+        name: bookingData.vendor?.name || 'Event Partner',
+        email: bookingData.vendor?.email || 'vendor@parvaevents.com',
+        category: bookingData.vendor?.category || 'Event Services',
+        location: bookingData.vendor?.location || 'Maharashtra'
+      };
+
+      // Trigger Email Automations in background (never block payment response)
+      sendPaymentAndBookingConfirmedEmails({
+        db,
+        booking: confirmedBooking,
+        customer,
+        vendor,
+        transaction: transactionData,
+        pdfBuffer,
+        commissionData
+      }).catch(err => console.error("Email Automation Error:", err));
+
+      // Trigger In-App Real-time Notification
+      await db.collection('broadcast_notifications').add({
+        title: `🎉 Booking Confirmed: #${bookingId}`,
+        message: `Booking verified for ${bookingData.vendor?.name} on ${bookingData.eventDate}. Receipt sent to email!`,
+        type: 'slot',
+        vendorId: bookingData.vendor?.id,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
     }
 
-    res.json({ success: true, transaction: transactionData });
+    res.json({ success: true, transaction: transactionData, booking: confirmedBooking });
   } catch (error) {
     console.error('Verify Payment Error:', error);
     res.status(500).json({ error: error.message || 'Payment verification failed' });
   }
 });
 
-// Secure endpoint to sync master admin to users collection (bypassing client rules)
+// ==================== 2. BOOKING CREATION, CANCELLATION & REFUND ROUTES ====================
+
+// A. Booking Created (Pending Request)
+app.post('/api/bookings/create', async (req, res) => {
+  try {
+    const { booking, customer, vendor } = req.body;
+    if (!booking || !booking.id) {
+      return res.status(400).json({ success: false, error: 'Booking details required.' });
+    }
+
+    const pendingBooking = {
+      ...booking,
+      status: booking.status || 'Pending',
+      paymentStatus: booking.paymentStatus || 'Pending',
+      createdAt: new Date().toISOString()
+    };
+
+    await db.collection('bookings').doc(booking.id).set(pendingBooking, { merge: true });
+
+    // Trigger Initial "Booking Request Received" Email
+    sendBookingCreatedEmail({
+      db,
+      booking: pendingBooking,
+      customer: customer || { name: 'Customer', email: booking.customerEmail },
+      vendor: vendor || { name: booking.vendor?.name || 'Vendor', email: booking.vendor?.email }
+    }).catch(err => console.error("Booking created email error:", err));
+
+    res.json({ success: true, booking: pendingBooking });
+  } catch (error) {
+    console.error('Create Booking Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// B. Booking Cancellation
+app.post('/api/bookings/:id/cancel', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason = 'Customer requested cancellation', refundAmount = 0, customer, vendor } = req.body;
+
+    const bookingRef = db.collection('bookings').doc(id);
+    const bookingDoc = await bookingRef.get();
+    
+    if (!bookingDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Booking not found.' });
+    }
+
+    const updatedBooking = {
+      ...bookingDoc.data(),
+      status: 'Cancelled',
+      cancellationReason: reason,
+      refundAmount: Number(refundAmount) || 0,
+      cancelledAt: new Date().toISOString()
+    };
+
+    await bookingRef.set(updatedBooking, { merge: true });
+
+    // Trigger Cancellation Emails
+    sendBookingCancellationEmail({
+      db,
+      booking: updatedBooking,
+      customer: customer || { name: updatedBooking.customerName || 'Customer', email: updatedBooking.customerEmail },
+      vendor: vendor || { name: updatedBooking.vendor?.name || 'Vendor', email: updatedBooking.vendor?.email },
+      reason,
+      refundAmount
+    }).catch(err => console.error("Cancellation email error:", err));
+
+    // In-App Notification
+    await db.collection('broadcast_notifications').add({
+      title: `⚠️ Booking Cancelled: #${id}`,
+      message: `Booking for ${updatedBooking.vendor?.name || 'Vendor'} has been cancelled.`,
+      type: 'system',
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, booking: updatedBooking });
+  } catch (error) {
+    console.error('Cancel Booking Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// C. Refund Processed
+app.post('/api/bookings/:id/refund', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { refundAmount, refundId, customer } = req.body;
+
+    const bookingRef = db.collection('bookings').doc(id);
+    const bookingDoc = await bookingRef.get();
+    
+    if (!bookingDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Booking not found.' });
+    }
+
+    const refundData = {
+      refundId: refundId || `rfd_${Date.now()}`,
+      amount: Number(refundAmount) || bookingDoc.data().refundAmount || 0,
+      processedAt: new Date().toISOString()
+    };
+
+    await bookingRef.set({
+      refundStatus: 'Processed',
+      refundData
+    }, { merge: true });
+
+    // Trigger Refund Email
+    sendRefundProcessedEmail({
+      db,
+      booking: bookingDoc.data(),
+      customer: customer || { name: bookingDoc.data().customerName || 'Customer', email: bookingDoc.data().customerEmail },
+      refundData
+    }).catch(err => console.error("Refund email error:", err));
+
+    res.json({ success: true, refundData });
+  } catch (error) {
+    console.error('Process Refund Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== 3. ADMIN EMAIL LOGS & TEST ROUTES ====================
+
+app.get('/api/admin/email-logs', async (req, res) => {
+  try {
+    const snap = await db.collection('email_events').orderBy('sentAt', 'desc').limit(50).get();
+    const logs = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.json({ success: true, logs });
+  } catch (error) {
+    console.error('Fetch Email Logs Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/admin/email-logs/retry', async (req, res) => {
+  try {
+    const { logId } = req.body;
+    const logRef = db.collection('email_events').doc(logId);
+    const logDoc = await logRef.get();
+
+    if (!logDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Log not found.' });
+    }
+
+    const data = logDoc.data();
+    const result = await sendIdempotentEmail({
+      db,
+      eventType: data.eventType,
+      bookingId: data.bookingId,
+      recipient: data.recipient,
+      subject: data.subject,
+      html: `<p>Retried automated notification from PARVA for event ${data.eventType}.</p>`
+    });
+
+    res.json({ success: true, result });
+  } catch (error) {
+    console.error('Retry Email Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/email/test', async (req, res) => {
+  try {
+    const { to = 'devanshkadam2@gmail.com' } = req.body;
+    const result = await sendIdempotentEmail({
+      db,
+      eventType: 'TEST_EMAIL',
+      bookingId: 'TEST-001',
+      recipient: to,
+      subject: '🎉 PARVA Email Automation Test — Resend API Active',
+      html: `
+        <div style="font-family: sans-serif; padding: 24px; color: #0f172a; max-width: 500px; margin: auto; border: 1px solid #e2e8f0; border-radius: 16px;">
+          <h2 style="color: #9d174d;">PARVA Celebrations</h2>
+          <p>This is a live test email confirming your <strong>Resend API</strong> integration is working with 100% reliability!</p>
+          <div style="background: #f8fafc; padding: 12px; border-radius: 8px; font-size: 13px;">
+            <p><strong>Status:</strong> Active & Operational</p>
+            <p><strong>Timestamp:</strong> ${new Date().toISOString()}</p>
+          </div>
+        </div>
+      `
+    });
+
+    res.json({ success: true, result });
+  } catch (error) {
+    console.error('Test Email Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== 4. EXISTING ADMIN & SYSTEM ROUTES ====================
+
 app.post('/api/admin/sync-user', async (req, res) => {
   try {
     const { uid, email, name } = req.body;
@@ -209,33 +527,17 @@ app.post('/api/admin/sync-user', async (req, res) => {
   }
 });
 
-// TEMPORARY DEBUG ENDPOINT
-app.get('/api/admin/debug-users', async (req, res) => {
-  try {
-    const snap = await db.collection('users').get();
-    const users = snap.docs.map(d => d.data());
-    res.json({ success: true, users });
-  } catch (e) {
-    res.json({ success: false, error: e.message });
-  }
-});
-
-// 2. ADMIN DASHBOARD STATS ROUTE
 app.get('/api/admin/dashboard', async (req, res) => {
   try {
-    // Fetch users count
     const usersSnap = await db.collection('users').get();
     const totalUsers = usersSnap.size;
 
-    // Fetch vendors count
     const vendorsSnap = await db.collection('vendors').get();
     const totalVendors = vendorsSnap.size;
 
-    // Fetch bookings count
     const bookingsSnap = await db.collection('bookings').get();
     const totalBookings = bookingsSnap.size;
 
-    // Fetch transaction totals
     const txnsSnap = await db.collection('transactions').get();
     let totalRevenue = 0;
     let totalGST = 0;
@@ -248,14 +550,12 @@ app.get('/api/admin/dashboard', async (req, res) => {
       if (data.status === 'Paid') {
         totalRevenue += (Number(data.totalAmount) || 0);
         totalGST += (Number(data.gstAmount) || 0);
-        totalCommission += (Number(data.commissionAmount) || 0);
+        totalCommission += (Number(data.platformCommission || data.commissionAmount) || 0);
         totalConnectionFees += (Number(data.connectionFee) || 0);
-        
         recentTransactions.push(data);
       }
     });
 
-    // Sort recent transactions by timestamp desc and take top 10
     recentTransactions.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
     const topTransactions = recentTransactions.slice(0, 10);
 
@@ -278,7 +578,6 @@ app.get('/api/admin/dashboard', async (req, res) => {
   }
 });
 
-// Admin Category Management Endpoints (Admin SDK bypasses client security rules)
 app.post('/api/admin/categories', async (req, res) => {
   try {
     const { id, name, icon, iconName, image } = req.body;
@@ -311,7 +610,6 @@ app.delete('/api/admin/categories/:id', async (req, res) => {
   }
 });
 
-// Admin Settings Management Endpoint
 app.post('/api/admin/settings', async (req, res) => {
   try {
     const { docId = 'global', data } = req.body;
@@ -323,10 +621,8 @@ app.post('/api/admin/settings', async (req, res) => {
   }
 });
 
-// 3. ADMIN RESET TO DEFAULTS ROUTE
 app.post('/api/admin/reset-defaults', async (req, res) => {
   try {
-    // 1. Delete all categories and write defaults
     const categoriesSnap = await db.collection('categories').get();
     for (const docSnap of categoriesSnap.docs) {
       await db.collection('categories').doc(docSnap.id).delete();
@@ -335,7 +631,6 @@ app.post('/api/admin/reset-defaults', async (req, res) => {
       await db.collection('categories').doc(cat.id).set(cat);
     }
 
-    // 2. Delete all promos and write defaults
     const promosSnap = await db.collection('promos').get();
     for (const docSnap of promosSnap.docs) {
       await db.collection('promos').doc(docSnap.id).delete();
@@ -344,7 +639,6 @@ app.post('/api/admin/reset-defaults', async (req, res) => {
       await db.collection('promos').doc(promo.id).set(promo);
     }
 
-    // 3. Delete all vendors and write defaults
     const vendorsSnap = await db.collection('vendors').get();
     for (const docSnap of vendorsSnap.docs) {
       await db.collection('vendors').doc(docSnap.id).delete();
@@ -353,13 +647,11 @@ app.post('/api/admin/reset-defaults', async (req, res) => {
       await db.collection('vendors').doc(vendor.id).set(vendor);
     }
 
-    // 4. Optionally clear transactions
     const txnsSnap = await db.collection('transactions').get();
     for (const docSnap of txnsSnap.docs) {
       await db.collection('transactions').doc(docSnap.id).delete();
     }
 
-    // 5. Optionally clear connections
     const connsSnap = await db.collection('connections').get();
     for (const docSnap of connsSnap.docs) {
       await db.collection('connections').doc(docSnap.id).delete();
@@ -376,5 +668,5 @@ app.post('/api/admin/reset-defaults', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PARVA Backend listening on port ${PORT}`);
+  console.log(`PARVA Backend & Resend Email Service listening on port ${PORT}`);
 });

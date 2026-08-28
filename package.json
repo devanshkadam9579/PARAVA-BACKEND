@@ -14,7 +14,9 @@
     "express": "^4.19.2",
     "firebase": "^12.16.0",
     "firebase-admin": "^12.1.0",
-    "razorpay": "^2.9.4"
+    "pdfkit": "^0.20.1",
+    "razorpay": "^2.9.4",
+    "resend": "^6.25.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
