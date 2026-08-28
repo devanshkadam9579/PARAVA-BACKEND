@@ -6,6 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import Razorpay from 'razorpay';
+import { v2 as cloudinary } from 'cloudinary';
 import admin from 'firebase-admin';
 import { DEFAULT_CATEGORIES, DEFAULT_PROMOS, DEFAULT_VENDORS } from './seedData.js';
 import { generateBookingPdf } from './services/pdfService.js';
@@ -58,6 +59,13 @@ const db = admin.apps.length > 0
   : null;
 
 // Initialize Razorpay SDK
+// Initialize Cloudinary SDK
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || 'k03rmhkg',
+  api_key: process.env.CLOUDINARY_API_KEY || '354754454388942',
+  api_secret: process.env.CLOUDINARY_API_SECRET || 'VJnWw6rsG05nPmBLOiUS5r0VDPw'
+});
+
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_TE7IEPsVrpMrj7',
   key_secret: process.env.RAZORPAY_KEY_SECRET || 'BTTxm1K1lZj7VeTKlDdYYeYO',
@@ -65,9 +73,40 @@ const razorpay = new Razorpay({
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 const PORT = process.env.PORT || 5000;
+
+// ==================== CLOUDINARY DIRECT UPLOAD ROUTE ====================
+app.post('/api/upload/image', async (req, res) => {
+  try {
+    const { image, folder = 'parva_vendors' } = req.body;
+    if (!image) {
+      return res.status(400).json({ success: false, error: 'No image data provided.' });
+    }
+
+    const uploadResponse = await cloudinary.uploader.upload(image, {
+      folder,
+      resource_type: 'image',
+      format: 'webp', // Auto-convert to ultra-compact WebP
+      quality: 'auto:good', // Cloudinary smart compression
+      fetch_format: 'auto'
+    });
+
+    console.log(`[Cloudinary] Successfully uploaded image: ${uploadResponse.secure_url}`);
+    res.json({
+      success: true,
+      url: uploadResponse.secure_url,
+      public_id: uploadResponse.public_id,
+      format: uploadResponse.format,
+      bytes: uploadResponse.bytes
+    });
+  } catch (error) {
+    console.error('Cloudinary Upload Error:', error);
+    res.status(500).json({ success: false, error: error.message || 'Image upload failed' });
+  }
+});
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'PARVA Celebrations Backend & Resend Email Automation Engine is Active!' });
