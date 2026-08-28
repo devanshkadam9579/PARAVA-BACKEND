@@ -706,6 +706,109 @@ app.post('/api/admin/reset-defaults', async (req, res) => {
   }
 });
 
+// ==================== 5. ADMIN MANAGEMENT ROUTES (BROADCAST, COUPONS, CITIES) ====================
+
+// A. Broadcast Notification Route
+app.post('/api/admin/broadcast', async (req, res) => {
+  try {
+    const { title, message, type = 'offer', imageUrl, actionText = 'View Details' } = req.body;
+    if (!title || !message) {
+      return res.status(400).json({ success: false, error: 'Title and message are required.' });
+    }
+
+    const docRef = await db.collection('broadcast_notifications').add({
+      title: title.trim(),
+      message: message.trim(),
+      type,
+      imageUrl: imageUrl || null,
+      actionText: actionText || 'View Details',
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, id: docRef.id });
+  } catch (error) {
+    console.error('Broadcast Notification Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// B. Coupons CRUD Routes
+app.get('/api/admin/coupons', async (req, res) => {
+  try {
+    const snap = await db.collection('coupons').get();
+    const coupons = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.json({ success: true, coupons });
+  } catch (error) {
+    console.error('Fetch Coupons Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/admin/coupons', async (req, res) => {
+  try {
+    const { code, discount, type = 'percentage', maxDiscount, minSpend, expiryDate, active = true } = req.body;
+    if (!code || !discount) {
+      return res.status(400).json({ success: false, error: 'Coupon code and discount are required.' });
+    }
+
+    const couponId = code.toUpperCase().trim();
+    const couponData = {
+      id: couponId,
+      code: couponId,
+      discount: Number(discount),
+      type,
+      maxDiscount: maxDiscount ? Number(maxDiscount) : null,
+      minSpend: minSpend ? Number(minSpend) : 0,
+      expiryDate: expiryDate || null,
+      active: Boolean(active),
+      createdAt: new Date().toISOString()
+    };
+
+    await db.collection('coupons').doc(couponId).set(couponData, { merge: true });
+    res.json({ success: true, coupon: couponData });
+  } catch (error) {
+    console.error('Create Coupon Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/admin/coupons/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.collection('coupons').doc(id).delete();
+    res.json({ success: true, message: `Coupon ${id} deleted successfully.` });
+  } catch (error) {
+    console.error('Delete Coupon Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// C. Cities Operations Route
+app.get('/api/admin/cities', async (req, res) => {
+  try {
+    const docSnap = await db.collection('settings').doc('cities').get();
+    const data = docSnap.exists ? docSnap.data() : { blockedCities: [] };
+    res.json({ success: true, blockedCities: data.blockedCities || [] });
+  } catch (error) {
+    console.error('Fetch Cities Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/admin/cities', async (req, res) => {
+  try {
+    const { blockedCities } = req.body;
+    await db.collection('settings').doc('cities').set({
+      blockedCities: blockedCities || [],
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+    res.json({ success: true, blockedCities });
+  } catch (error) {
+    console.error('Save Cities Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`PARVA Backend & Resend Email Service listening on port ${PORT}`);
 });
