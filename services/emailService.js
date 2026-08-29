@@ -112,6 +112,9 @@ export async function sendIdempotentEmail({ db, eventType, bookingId, recipient,
     }
 
     const resendResponse = await resend.emails.send(payload);
+    if (resendResponse.error) {
+      throw new Error(resendResponse.error.message || 'Resend delivery failed');
+    }
     const messageId = resendResponse.data?.id || 'resend_msg_' + Date.now();
 
     // 3. Log Success to Firestore
