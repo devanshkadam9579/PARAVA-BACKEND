@@ -194,8 +194,9 @@ async function handleCreateCashfreeOrder(req, res) {
         try {
           const reqSlot = (eventTimeSlot || 'full_day').toLowerCase();
           const conflictingSlots = reqSlot === 'full_day' 
-            ? ['full_day', 'morning', 'evening'] 
+            ? ['full_day', 'morning', 'afternoon', 'evening'] 
             : [reqSlot, 'full_day'];
+
 
           await db.runTransaction(async (transaction) => {
             const reservationRefs = conflictingSlots.map(s => 

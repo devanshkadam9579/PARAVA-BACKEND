@@ -97,8 +97,9 @@ export async function generateBookingPdf(data) {
       doc.fillColor(primaryColor).fontSize(10).font('Helvetica-Bold').text('EVENT SCHEDULE & SPECIFICATIONS', 55, eventBoxY + 10);
       doc.fillColor(darkColor).fontSize(9).font('Helvetica')
         .text(`Occasion: ${eventType}`, 55, eventBoxY + 28)
-        .text(`Date of Event: ${eventDate}`, 210, eventBoxY + 28)
-        .text(`Guest Capacity: ${guestCount || 'Standard'}`, 390, eventBoxY + 28);
+        .text(`Date of Event: ${eventDate}`, 190, eventBoxY + 28)
+        .text(`Slot: ${eventTimeSlot || 'Full Day (09:00 AM – 10:00 PM)'}`, 310, eventBoxY + 28)
+        .text(`Guests: ${guestCount || 100}`, 470, eventBoxY + 28);
 
       // 4. Financial & Line Item Breakdown Table
       const tableY = eventBoxY + 68;
@@ -135,7 +136,8 @@ export async function generateBookingPdf(data) {
       doc.fillColor(secondaryColor).fontSize(8).font('Helvetica')
         .text(`Payment Ref: ${paymentId}`, 40, totalBoxY + 15)
         .text(`Order Reference: ${orderId}`, 40, totalBoxY + 28)
-        .text(`Gateway: Razorpay Automated Settlement`, 40, totalBoxY + 41);
+        .text(`Gateway: Cashfree Payments Secured Settlement`, 40, totalBoxY + 41);
+
 
       // 5. Legal & Policies Box
       const legalY = totalBoxY + 95;

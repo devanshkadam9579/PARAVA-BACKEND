@@ -228,12 +228,27 @@ export async function sendBookingCreatedEmail({ db, booking, customer, vendor })
   }
 }
 
+function formatTimeSlot(slotId) {
+  switch ((slotId || '').toLowerCase()) {
+    case 'morning':
+      return 'Morning (09:00 AM – 01:00 PM)';
+    case 'afternoon':
+      return 'Afternoon (01:00 PM – 05:00 PM)';
+    case 'evening':
+      return 'Evening (05:00 PM – 10:00 PM)';
+    case 'full_day':
+    default:
+      return 'Full Day (09:00 AM – 10:00 PM)';
+  }
+}
+
 /**
  * 2. Payment Successful & Booking Confirmed (With Official PDF Attachment & Multi-Vendor Handling)
  */
 export async function sendPaymentAndBookingConfirmedEmails({ db, booking, customer, vendor, transaction, pdfBuffer, commissionData }) {
   const bookingId = booking.id || booking.bookingIdString;
   const bookingDate = booking.eventDate || 'TBD';
+  const timeSlotFormatted = formatTimeSlot(booking.eventTimeSlot);
   const amountPaid = transaction?.totalAmount || booking.finalPrice || booking.totalPrice || 0;
   const paymentId = transaction?.paymentId || 'PAY_SUCCESS';
 
@@ -251,6 +266,7 @@ export async function sendPaymentAndBookingConfirmedEmails({ db, booking, custom
         <div class="info-row"><span class="info-label">Payment ID:</span><span class="info-value" style="font-family: monospace;">${paymentId}</span></div>
         <div class="info-row"><span class="info-label">Service & Vendor:</span><span class="info-value">${vendor.name} (${vendor.category})</span></div>
         <div class="info-row"><span class="info-label">Event Date:</span><span class="info-value">${bookingDate}</span></div>
+        <div class="info-row"><span class="info-label">Time Slot:</span><span class="info-value font-bold" style="color: #9d174d;">${timeSlotFormatted}</span></div>
         <div class="info-row"><span class="info-label">Location / City:</span><span class="info-value">${vendor.location || 'Kolhapur'}</span></div>
         <div class="info-row"><span class="info-label">Amount Paid:</span><span class="info-value amount-highlight">₹${Number(amountPaid).toLocaleString('en-IN')}</span></div>
         <div class="info-row"><span class="info-label">Payment Status:</span><span class="info-value" style="color: #059669;">✓ Verified (Paid)</span></div>
@@ -263,7 +279,7 @@ export async function sendPaymentAndBookingConfirmedEmails({ db, booking, custom
 
       <h4 style="font-size: 13px; color: #0f172a; margin: 20px 0 8px 0;">Next Steps:</h4>
       <ol style="color: #475569; font-size: 13px; padding-left: 20px; margin: 0;">
-        <li>The vendor has been notified and scheduled for your event date.</li>
+        <li>The vendor has been notified and scheduled for your event date (${timeSlotFormatted}).</li>
         <li>Access your live in-app chat to communicate any specific requirements.</li>
         <li>You can view, manage, or share your celebration plan anytime from your dashboard.</li>
       </ol>
@@ -308,15 +324,17 @@ export async function sendPaymentAndBookingConfirmedEmails({ db, booking, custom
           <div class="info-row"><span class="info-label">Customer Name:</span><span class="info-value">${customer.name}</span></div>
           <div class="info-row"><span class="info-label">Customer Contact:</span><span class="info-value">${customer.phone || 'Available in Vendor Hub'}</span></div>
           <div class="info-row"><span class="info-label">Event Date:</span><span class="info-value">${bookingDate}</span></div>
+          <div class="info-row"><span class="info-label">Time Slot:</span><span class="info-value font-bold" style="color: #9d174d;">${timeSlotFormatted}</span></div>
           <div class="info-row"><span class="info-label">Gross Booking Value:</span><span class="info-value">₹${Number(amountPaid).toLocaleString('en-IN')}</span></div>
           <div class="info-row"><span class="info-label">Platform Commission:</span><span class="info-value" style="color: #64748b;">- ₹${Number(platformCommission).toLocaleString('en-IN')}</span></div>
           <div class="info-row"><span class="info-label">Net Vendor Payout:</span><span class="info-value amount-highlight">₹${Number(vendorPayout).toLocaleString('en-IN')}</span></div>
         </div>
 
-        <p style="color: #475569; font-size: 13px;">This date has been automatically blocked in your Operational Schedule Calendar.</p>
+        <p style="color: #475569; font-size: 13px;">This date and time slot (${timeSlotFormatted}) have been automatically blocked in your Operational Schedule Calendar.</p>
       `,
       actionButton: { text: 'Open Vendor Dashboard', url: `${APP_URL}` }
     });
+
 
     await sendIdempotentEmail({
       db,
