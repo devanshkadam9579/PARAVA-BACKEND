@@ -3,7 +3,8 @@ import { Resend } from 'resend';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || 're_X3SKrWAN_5esWMaAP7RfPqPzULAV6gmHE';
 const DEFAULT_FROM = process.env.EMAIL_FROM || 'PARVA Celebrations <onboarding@resend.dev>';
 const APP_URL = process.env.APP_URL || 'https://parava-frontend.onrender.com';
-const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'support@parvaevents.com';
+const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'support@parva.com';
+const SUPPORT_PHONE = '8554006073';
 
 const resend = new Resend(RESEND_API_KEY);
 
@@ -28,20 +29,19 @@ function getEmailLayout({ title, badge, contentHtml, actionButton, termsVersion 
     .content { padding: 32px 28px; line-height: 1.6; }
     .info-card { background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 16px; padding: 20px; margin: 20px 0; }
     .info-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px dashed #e2e8f0; font-size: 13px; }
-    .info-row:last-child { border-bottom: none; }
     .info-label { color: #64748b; font-weight: 600; }
     .info-value { color: #0f172a; font-weight: 700; text-align: right; }
-    .amount-highlight { font-size: 20px; font-weight: 800; color: #9d174d; }
-    .btn { display: inline-block; width: 100%; box-sizing: border-box; text-align: center; background-color: #9d174d; color: #ffffff !important; text-decoration: none; font-weight: 700; font-size: 14px; padding: 14px 24px; border-radius: 14px; margin: 24px 0 12px 0; }
-    .footer { background-color: #f1f5f9; padding: 24px 28px; text-align: center; font-size: 11px; color: #64748b; border-top: 1px solid #e2e8f0; }
-    .footer-links a { color: #9d174d; text-decoration: none; margin: 0 6px; font-weight: 600; }
-    .legal-notice { font-size: 10px; color: #94a3b8; margin-top: 12px; }
+    .amount-highlight { color: #9d174d; font-size: 18px; font-weight: 900; }
+    .btn { display: inline-block; background-color: #9d174d; color: #ffffff !important; padding: 14px 28px; border-radius: 12px; font-weight: 700; font-size: 14px; text-decoration: none; margin-top: 20px; box-shadow: 0 4px 12px rgba(157, 23, 77, 0.25); text-align: center; }
+    .footer { background-color: #f1f5f9; padding: 24px; text-align: center; font-size: 11px; color: #64748b; border-top: 1px solid #e2e8f0; }
+    .footer-links a { color: #64748b; text-decoration: underline; margin: 0 6px; }
+    .legal-notice { margin-top: 12px; color: #94a3b8; font-size: 10px; line-height: 1.5; }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
-      <h1 class="brand-title">PARVA CELEBRATIONS</h1>
+      <h1 class="brand-title">PARVA</h1>
       <p class="brand-subtitle">Verified Event Marketplace & Planner</p>
       ${badge ? `<div class="badge">${badge}</div>` : ''}
     </div>
@@ -53,7 +53,7 @@ function getEmailLayout({ title, badge, contentHtml, actionButton, termsVersion 
     </div>
 
     <div class="footer">
-      <p style="margin: 0 0 8px 0;">Need assistance? Reach out to <a href="mailto:${SUPPORT_EMAIL}" style="color: #9d174d; font-weight: 700;">${SUPPORT_EMAIL}</a></p>
+      <p style="margin: 0 0 8px 0;">Need assistance? Reach out to <a href="mailto:${SUPPORT_EMAIL}" style="color: #9d174d; font-weight: 700;">${SUPPORT_EMAIL}</a> or Helpline <a href="tel:${SUPPORT_PHONE}" style="color: #9d174d; font-weight: 700;">${SUPPORT_PHONE}</a></p>
       <div class="footer-links">
         <a href="${APP_URL}/terms">Terms & Conditions</a> •
         <a href="${APP_URL}/privacy">Privacy Policy</a> •
@@ -88,80 +88,76 @@ export async function sendIdempotentEmail({ db, eventType, bookingId, recipient,
       const existingDoc = await db.collection('email_events').doc(eventDocId).get();
       if (existingDoc.exists && existingDoc.data().status === 'sent') {
         console.log(`[EmailService] Idempotency: Email ${eventType} for ${bookingId} already sent. Skipping.`);
-        return { success: true, idempotentSkipped: true, messageId: existingDoc.data().providerMessageId };
+        return { success: true, idempotentSkipped: true, logId: eventDocId };
       }
     } catch (e) {
-      console.warn('[EmailService] Firestore idempotency check error:', e);
+      console.warn("[EmailService] Idempotency check error:", e);
     }
   }
 
-  // 2. Dispatch via Resend
+  // 2. Dispatch via Resend SDK
   try {
     const payload = {
       from: DEFAULT_FROM,
       to: [recipient],
-      subject,
-      html
+      subject: subject,
+      html: html,
+      ...(attachments.length > 0 ? { attachments } : {})
     };
 
-    if (attachments && attachments.length > 0) {
-      payload.attachments = attachments.map(att => ({
-        filename: att.filename,
-        content: att.content.toString('base64')
-      }));
-    }
+    const { data, error } = await resend.emails.send(payload);
 
-    const resendResponse = await resend.emails.send(payload);
-    if (resendResponse.error) {
-      throw new Error(resendResponse.error.message || 'Resend delivery failed');
-    }
-    const messageId = resendResponse.data?.id || 'resend_msg_' + Date.now();
-
-    // 3. Log Success to Firestore
-    if (db) {
-      await db.collection('email_events').doc(eventDocId).set({
-        id: eventDocId,
-        eventType,
-        bookingId: bookingId || 'N/A',
-        recipient,
-        subject,
-        status: 'sent',
-        providerMessageId: messageId,
-        sentAt: new Date().toISOString(),
-        error: null
-      }, { merge: true });
-    }
-
-    console.log(`[EmailService] Sent '${eventType}' email to ${recipient} (Message ID: ${messageId})`);
-    return { success: true, messageId };
-  } catch (error) {
-    console.error(`[EmailService] Error sending '${eventType}' email to ${recipient}:`, error);
-
-    if (db) {
-      try {
+    if (error) {
+      console.error(`[EmailService] Resend API Error (${eventType} -> ${recipient}):`, error);
+      if (db) {
         await db.collection('email_events').doc(eventDocId).set({
-          id: eventDocId,
           eventType,
           bookingId: bookingId || 'N/A',
           recipient,
           subject,
           status: 'failed',
-          error: error.message || String(error),
-          failedAt: new Date().toISOString()
+          error: error.message || JSON.stringify(error),
+          lastAttemptAt: new Date().toISOString()
         }, { merge: true });
-      } catch (logErr) {
-        console.error('[EmailService] Failed to log email error:', logErr);
       }
+      return { success: false, error };
     }
 
-    return { success: false, error: error.message };
+    console.log(`[EmailService] Email sent successfully (${eventType} -> ${recipient}), Resend ID: ${data?.id}`);
+
+    // 3. Log Success Event in Firestore
+    if (db) {
+      await db.collection('email_events').doc(eventDocId).set({
+        eventType,
+        bookingId: bookingId || 'N/A',
+        recipient,
+        subject,
+        status: 'sent',
+        resendId: data?.id || 'simulated',
+        sentAt: new Date().toISOString()
+      }, { merge: true });
+    }
+
+    return { success: true, resendId: data?.id };
+  } catch (err) {
+    console.error(`[EmailService] Unexpected Exception during email dispatch:`, err);
+    if (db) {
+      await db.collection('email_events').doc(eventDocId).set({
+        eventType,
+        bookingId: bookingId || 'N/A',
+        recipient,
+        subject,
+        status: 'failed',
+        error: err.message,
+        lastAttemptAt: new Date().toISOString()
+      }, { merge: true });
+    }
+    return { success: false, error: err.message };
   }
 }
 
-// ==================== EMAIL EVENT DISPATCHERS ====================
-
 /**
- * 1. Booking Created (Pending Payment/Approval)
+ * 1. Initial Booking Created (Pending Payment / Verification)
  */
 export async function sendBookingCreatedEmail({ db, booking, customer, vendor }) {
   const bookingId = booking.id || booking.bookingIdString;
@@ -172,9 +168,9 @@ export async function sendBookingCreatedEmail({ db, booking, customer, vendor })
     title: 'Booking Request Received',
     badge: 'Status: Pending Confirmation',
     contentHtml: `
-      <h2 style="font-size: 20px; font-weight: 800; color: #0f172a; margin-top: 0;">Booking Request Received! 🌸</h2>
+      <h2 style="font-size: 20px; font-weight: 800; color: #0f172a; margin-top: 0;">We've Received Your Booking Request! 🎉</h2>
       <p style="color: #475569; font-size: 14px;">Hi <strong>${customer.name}</strong>,</p>
-      <p style="color: #475569; font-size: 14px;">We have received your booking request for <strong>${vendor.name}</strong>. Please note that your booking is <strong>NOT YET CONFIRMED</strong> until payment verification and vendor calendar alignment are finalized.</p>
+      <p style="color: #475569; font-size: 14px;">Thank you for choosing PARVA for your celebration. We have received your booking request for <strong>${vendor.name}</strong>.</p>
       
       <div class="info-card">
         <div class="info-row"><span class="info-label">Booking ID:</span><span class="info-value">#${bookingId}</span></div>
@@ -233,13 +229,13 @@ export async function sendBookingCreatedEmail({ db, booking, customer, vendor })
 }
 
 /**
- * 2. Payment Successful & Booking Confirmed (With Official PDF Attachment)
+ * 2. Payment Successful & Booking Confirmed (With Official PDF Attachment & Multi-Vendor Handling)
  */
 export async function sendPaymentAndBookingConfirmedEmails({ db, booking, customer, vendor, transaction, pdfBuffer, commissionData }) {
   const bookingId = booking.id || booking.bookingIdString;
   const bookingDate = booking.eventDate || 'TBD';
-  const amountPaid = transaction.totalAmount || booking.finalPrice || booking.totalPrice || 0;
-  const paymentId = transaction.paymentId || 'PAY_SUCCESS';
+  const amountPaid = transaction?.totalAmount || booking.finalPrice || booking.totalPrice || 0;
+  const paymentId = transaction?.paymentId || 'PAY_SUCCESS';
 
   // Customer Email (Confirmation + Receipt + PDF Attachment)
   const customerHtml = getEmailLayout({
@@ -287,8 +283,15 @@ export async function sendPaymentAndBookingConfirmedEmails({ db, booking, custom
     attachments
   });
 
-  // Vendor Email (New Confirmed Booking & Payout Statement)
-  if (vendor.email) {
+  // Multi-Vendor or Single Vendor Email Dispatch
+  const vendorsList = Array.isArray(booking.vendors) && booking.vendors.length > 0 
+    ? booking.vendors 
+    : [{ vendorId: vendor.id, vendorName: vendor.name, email: vendor.email, services: booking.selectedServices }];
+
+  for (const v of vendorsList) {
+    const vEmail = v.email || (v.vendorId === vendor.id ? vendor.email : null);
+    if (!vEmail) continue;
+
     const vendorPayout = commissionData?.vendorPayout || (amountPaid * 0.9);
     const platformCommission = commissionData?.platformCommission || (amountPaid * 0.1);
 
@@ -297,7 +300,7 @@ export async function sendPaymentAndBookingConfirmedEmails({ db, booking, custom
       badge: '✓ Confirmed Order',
       contentHtml: `
         <h2 style="font-size: 20px; font-weight: 800; color: #059669; margin-top: 0;">New Confirmed Booking Received! 💰</h2>
-        <p style="color: #475569; font-size: 14px;">Hi <strong>${vendor.name}</strong>,</p>
+        <p style="color: #475569; font-size: 14px;">Hi <strong>${v.vendorName || vendor.name}</strong>,</p>
         <p style="color: #475569; font-size: 14px;">Customer <strong>${customer.name}</strong> has paid and confirmed their reservation for your service.</p>
         
         <div class="info-card">
@@ -317,9 +320,9 @@ export async function sendPaymentAndBookingConfirmedEmails({ db, booking, custom
 
     await sendIdempotentEmail({
       db,
-      eventType: 'BOOKING_CONFIRMED_VENDOR',
+      eventType: `BOOKING_CONFIRMED_VENDOR_${v.vendorId || 'primary'}`,
       bookingId,
-      recipient: vendor.email,
+      recipient: vEmail,
       subject: `New Booking Confirmed — #${bookingId}`,
       html: vendorHtml
     });
@@ -344,11 +347,12 @@ export async function sendBookingCancellationEmail({ db, booking, customer, vend
       <div class="info-card">
         <div class="info-row"><span class="info-label">Booking Reference:</span><span class="info-value">#${bookingId}</span></div>
         <div class="info-row"><span class="info-label">Cancellation Reason:</span><span class="info-value">${reason}</span></div>
+        <div class="info-row"><span class="info-label">Refund Request Status:</span><span class="info-value">Logged for Support</span></div>
         <div class="info-row"><span class="info-label">Refund Amount:</span><span class="info-value amount-highlight">₹${Number(refundAmount).toLocaleString('en-IN')}</span></div>
-        <div class="info-row"><span class="info-label">Refund Timeline:</span><span class="info-value">5-7 Business Days</span></div>
       </div>
 
-      <p style="color: #64748b; font-size: 12px;">Refunds are credited directly to your original payment method in accordance with our cancellation policy.</p>
+      <p style="color: #64748b; font-size: 12px;">Refunds are reviewed and managed directly by our support team (<a href="mailto:support@parva.com" style="color: #9d174d; font-weight: 700;">support@parva.com</a> / Helpline: <strong>8554006073</strong>) in accordance with our cancellation policy.</p>
+
     `,
     actionButton: { text: 'Explore Other Vendors', url: `${APP_URL}` }
   });

@@ -189,33 +189,57 @@ async function handleCreateCashfreeOrder(req, res) {
       servicesTotal = connectionFee;
       rawBookingFee = connectionFee;
     } else if (type === 'booking') {
-      // 1. Double Booking & Slot Locking Protection (Atomic Check)
+      // 1. True Atomic Double Booking & Slot Locking Protection (Firestore Transaction)
       if (vendorId && eventDate && db) {
         try {
-          const conflictQuery = await db.collection('bookings')
-            .where('vendor.id', '==', vendorId)
-            .where('eventDate', '==', eventDate)
-            .where('paymentStatus', '==', 'Paid')
-            .get();
+          const reqSlot = (eventTimeSlot || 'full_day').toLowerCase();
+          const conflictingSlots = reqSlot === 'full_day' 
+            ? ['full_day', 'morning', 'evening'] 
+            : [reqSlot, 'full_day'];
 
-          const hasConflict = conflictQuery.docs.some(doc => {
-            const bData = doc.data();
-            if (bData.status === 'Cancelled' || bData.status === 'Rejected') return false;
-            const bSlot = bData.eventTimeSlot || 'full_day';
-            const reqSlot = eventTimeSlot || 'full_day';
-            return bSlot === 'full_day' || reqSlot === 'full_day' || bSlot === reqSlot;
+          await db.runTransaction(async (transaction) => {
+            const reservationRefs = conflictingSlots.map(s => 
+              db.collection('slot_reservations').doc(`${vendorId}_${eventDate}_${s}`)
+            );
+            const snapshots = await Promise.all(reservationRefs.map(ref => transaction.get(ref)));
+
+            for (const snap of snapshots) {
+              if (snap.exists) {
+                const data = snap.data();
+                const now = Date.now();
+                const isConfirmed = data.status === 'CONFIRMED';
+                const isHoldActive = data.status === 'PENDING_PAYMENT' && data.expiresAt > now && data.orderId !== orderId;
+
+                if (isConfirmed || isHoldActive) {
+                  throw new Error(`SLOT_ALREADY_RESERVED:${data.slot || reqSlot}`);
+                }
+              }
+            }
+
+            // Lock the requested slot atomically with a 15-minute lease for checkout
+            const targetRef = db.collection('slot_reservations').doc(`${vendorId}_${eventDate}_${reqSlot}`);
+            transaction.set(targetRef, {
+              vendorId,
+              eventDate,
+              slot: reqSlot,
+              orderId,
+              userId: userId || 'Guest',
+              status: 'PENDING_PAYMENT',
+              expiresAt: Date.now() + 15 * 60 * 1000,
+              createdAt: new Date().toISOString()
+            });
           });
-
-          if (hasConflict) {
+        } catch (txnErr) {
+          if (txnErr.message && txnErr.message.startsWith('SLOT_ALREADY_RESERVED')) {
             return res.status(409).json({
               success: false,
-              error: `Sorry, this vendor slot is already booked for ${eventDate} (${eventTimeSlot || 'selected slot'}). Please choose another date or time slot.`
+              error: `Slot Conflict: This vendor slot is already reserved or confirmed for ${eventDate} (${eventTimeSlot || 'selected slot'}). Please choose another date or time slot.`
             });
           }
-        } catch (slotErr) {
-          console.warn("[Slot Lock Check]:", slotErr.message);
+          console.warn("[Slot Reservation Warning]:", txnErr.message);
         }
       }
+
 
       // 2. Authoritative Vendor Price Recalculation
       if (vendorId && db) {
@@ -832,7 +856,7 @@ app.post('/api/bookings/:id/cancel', async (req, res) => {
     // In-App Broadcast Notification
     await db.collection('broadcast_notifications').add({
       title: `⚠️ Booking Cancelled: #${id}`,
-      message: `Booking for ${updatedBooking.vendor?.name || 'Vendor'} has been cancelled.${shouldRequestRefund ? ' Refund request logged for support@parvaevents.com.' : ''}`,
+      message: `Booking for ${updatedBooking.vendor?.name || 'Vendor'} has been cancelled.${shouldRequestRefund ? ' Refund request logged for support@parva.com.' : ''}`,
       type: 'system',
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
@@ -840,8 +864,9 @@ app.post('/api/bookings/:id/cancel', async (req, res) => {
     res.json({ 
       success: true, 
       booking: updatedBooking,
-      message: shouldRequestRefund ? 'Refund request submitted. Our support team (support@parvaevents.com) will process your refund.' : 'Booking cancelled successfully.'
+      message: shouldRequestRefund ? 'Refund request submitted. Our support team (support@parva.com / Helpline: 8554006073) will process your refund.' : 'Booking cancelled successfully.'
     });
+
   } catch (error) {
     console.error('Cancel Booking Error:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -957,8 +982,9 @@ app.post('/api/bookings/:id/refund', async (req, res) => {
       amount: finalRefundAmt,
       status: 'Processed',
       processedAt: new Date().toISOString(),
-      processedBy: 'support@parvaevents.com'
+      processedBy: 'support@parva.com'
     };
+
 
     await bookingRef.set({
       refundStatus: 'Processed',
