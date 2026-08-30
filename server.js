@@ -980,8 +980,10 @@ app.post('/api/bookings/:id/refund', async (req, res) => {
     console.error('Process Refund Error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
+});
 
 // ==================== 3. ADMIN EMAIL LOGS & TEST ROUTES ====================
+
 
 
 app.get('/api/admin/email-logs', async (req, res) => {
