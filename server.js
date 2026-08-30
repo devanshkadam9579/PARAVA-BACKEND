@@ -189,7 +189,35 @@ async function handleCreateCashfreeOrder(req, res) {
       servicesTotal = connectionFee;
       rawBookingFee = connectionFee;
     } else if (type === 'booking') {
-      // 1. Authoritative Vendor Price Recalculation
+      // 1. Double Booking & Slot Locking Protection (Atomic Check)
+      if (vendorId && eventDate && db) {
+        try {
+          const conflictQuery = await db.collection('bookings')
+            .where('vendor.id', '==', vendorId)
+            .where('eventDate', '==', eventDate)
+            .where('paymentStatus', '==', 'Paid')
+            .get();
+
+          const hasConflict = conflictQuery.docs.some(doc => {
+            const bData = doc.data();
+            if (bData.status === 'Cancelled' || bData.status === 'Rejected') return false;
+            const bSlot = bData.eventTimeSlot || 'full_day';
+            const reqSlot = eventTimeSlot || 'full_day';
+            return bSlot === 'full_day' || reqSlot === 'full_day' || bSlot === reqSlot;
+          });
+
+          if (hasConflict) {
+            return res.status(409).json({
+              success: false,
+              error: `Sorry, this vendor slot is already booked for ${eventDate} (${eventTimeSlot || 'selected slot'}). Please choose another date or time slot.`
+            });
+          }
+        } catch (slotErr) {
+          console.warn("[Slot Lock Check]:", slotErr.message);
+        }
+      }
+
+      // 2. Authoritative Vendor Price Recalculation
       if (vendorId && db) {
         try {
           const vDoc = await db.collection('vendors').doc(vendorId).get();
@@ -201,16 +229,19 @@ async function handleCreateCashfreeOrder(req, res) {
         }
       }
 
-      // Compute services total server-side
+      // Compute services total server-side with strict unit logic
       if (Array.isArray(selectedServices) && selectedServices.length > 0) {
         servicesTotal = selectedServices.reduce((sum, item) => {
           const itemPrice = Number(item.price) || 0;
-          const qty = Number(item.quantity) || 1;
-          const isCatering = item.unit === 'per plate' || (vendorData && vendorData.category === 'Catering');
-          if (isCatering) {
-            const guests = Number(planningGuestSize) || 100;
+          const qty = Math.max(1, Number(item.quantity) || 1);
+          const unitStr = String(item.unit || '').toLowerCase();
+          const isPerPersonOrPlate = unitStr.includes('plate') || unitStr.includes('person') || unitStr.includes('guest') || (vendorData && vendorData.category === 'Catering' && !unitStr.includes('fixed') && !unitStr.includes('package') && !unitStr.includes('event'));
+          
+          if (isPerPersonOrPlate) {
+            const guests = Math.max(1, Number(planningGuestSize) || 100);
             return sum + (itemPrice * guests);
           }
+          // Hourly, per-item, fixed or package pricing
           return sum + (itemPrice * qty);
         }, 0);
       } else if (vendorData && vendorData.basePrice) {
@@ -219,6 +250,7 @@ async function handleCreateCashfreeOrder(req, res) {
       } else {
         servicesTotal = Number(req.body.amount) || 5000;
       }
+
 
       // 2. Fetch Admin Global Settings (Booking Fee % and Commission %)
       let bookingFeePct = 5;
@@ -750,7 +782,7 @@ app.post('/api/bookings/create', async (req, res) => {
   }
 });
 
-// B. Booking Cancellation
+// B. Booking Cancellation (Customer Requested with Support-Managed Refund Engine)
 app.post('/api/bookings/:id/cancel', async (req, res) => {
   try {
     const { id } = req.params;
@@ -763,46 +795,151 @@ app.post('/api/bookings/:id/cancel', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Booking not found.' });
     }
 
+    const bData = bookingDoc.data();
+    const isPaid = bData.paymentStatus === 'Paid';
+    const currentRefundStatus = bData.refundStatus;
+    
+    // Prevent duplicate refund requests if already Requested / Under Review / Processed
+    const shouldRequestRefund = isPaid && (!currentRefundStatus || currentRefundStatus === 'Not Requested');
+    const calculatedRefundAmt = Number(refundAmount) || bData.finalPrice || bData.totalPrice || 0;
+
     const updatedBooking = {
-      ...bookingDoc.data(),
+      ...bData,
       status: 'Cancelled',
       cancellationReason: reason,
-      refundAmount: Number(refundAmount) || 0,
-      cancelledAt: new Date().toISOString()
+      cancelledAt: new Date().toISOString(),
+      ...(shouldRequestRefund ? {
+        refundStatus: 'Requested',
+        refundRequestedAt: new Date().toISOString(),
+        refundRequestedBy: 'customer',
+        refundReason: reason,
+        refundAmount: calculatedRefundAmt
+      } : {})
     };
 
     await bookingRef.set(updatedBooking, { merge: true });
 
-    // Trigger Cancellation Emails
+    // Trigger Cancellation Emails (Customer + Vendor + Support)
     sendBookingCancellationEmail({
       db,
       booking: updatedBooking,
       customer: customer || { name: updatedBooking.customerName || 'Customer', email: updatedBooking.customerEmail },
       vendor: vendor || { name: updatedBooking.vendor?.name || 'Vendor', email: updatedBooking.vendor?.email },
       reason,
-      refundAmount
+      refundAmount: calculatedRefundAmt
     }).catch(err => console.error("Cancellation email error:", err));
 
-    // In-App Notification
+    // In-App Broadcast Notification
     await db.collection('broadcast_notifications').add({
       title: `⚠️ Booking Cancelled: #${id}`,
-      message: `Booking for ${updatedBooking.vendor?.name || 'Vendor'} has been cancelled.`,
+      message: `Booking for ${updatedBooking.vendor?.name || 'Vendor'} has been cancelled.${shouldRequestRefund ? ' Refund request logged for support@parvaevents.com.' : ''}`,
       type: 'system',
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    res.json({ success: true, booking: updatedBooking });
+    res.json({ 
+      success: true, 
+      booking: updatedBooking,
+      message: shouldRequestRefund ? 'Refund request submitted. Our support team (support@parvaevents.com) will process your refund.' : 'Booking cancelled successfully.'
+    });
   } catch (error) {
     console.error('Cancel Booking Error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// C. Refund Processed
+// C. Vendor Respond (Accept / Reject Flow with Authorization)
+app.post('/api/vendor/bookings/:id/respond', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { action, vendorId, reason } = req.body; // action = 'accept' | 'reject'
+
+    if (!id || !action || !vendorId) {
+      return res.status(400).json({ success: false, error: 'Booking ID, vendorId, and action (accept/reject) are required.' });
+    }
+
+    const bookingRef = db.collection('bookings').doc(id);
+    const bookingDoc = await bookingRef.get();
+
+    if (!bookingDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Booking not found.' });
+    }
+
+    const bData = bookingDoc.data();
+    
+    // Strict Vendor Authorization Check
+    const bookingVendorId = bData.vendor?.id || bData.vendorId;
+    if (bookingVendorId !== vendorId) {
+      return res.status(403).json({ success: false, error: 'Unauthorized: You can only respond to your own vendor bookings.' });
+    }
+
+    if (action === 'accept') {
+      const updatedBooking = {
+        ...bData,
+        status: 'Confirmed',
+        vendorAcceptedAt: new Date().toISOString()
+      };
+
+      await bookingRef.set(updatedBooking, { merge: true });
+
+      // Notify customer that vendor accepted
+      await db.collection('broadcast_notifications').add({
+        title: `🎉 Vendor Confirmed: #${id}`,
+        message: `${bData.vendor?.name || 'Your vendor'} has accepted your event booking!`,
+        type: 'booking_accepted',
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      return res.json({ success: true, status: 'Confirmed', booking: updatedBooking });
+    } else if (action === 'reject') {
+      const isPaid = bData.paymentStatus === 'Paid';
+      const shouldRequestRefund = isPaid && (!bData.refundStatus || bData.refundStatus === 'Not Requested');
+      const refundAmt = bData.finalPrice || bData.totalPrice || 0;
+
+      const updatedBooking = {
+        ...bData,
+        status: 'Rejected',
+        rejectionReason: reason || 'Vendor unavailable on requested schedule',
+        rejectedAt: new Date().toISOString(),
+        ...(shouldRequestRefund ? {
+          refundStatus: 'Requested',
+          refundRequestedAt: new Date().toISOString(),
+          refundRequestedBy: 'vendor_rejection',
+          refundReason: reason || 'Vendor declined event booking',
+          refundAmount: refundAmt
+        } : {})
+      };
+
+      await bookingRef.set(updatedBooking, { merge: true });
+
+      // Notify customer that vendor declined
+      await db.collection('broadcast_notifications').add({
+        title: `⚠️ Vendor Declined: #${id}`,
+        message: `${bData.vendor?.name || 'The vendor'} was unable to accept this booking. ${shouldRequestRefund ? 'Your advance fee refund request has been created.' : ''}`,
+        type: 'booking_rejected',
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      return res.json({ 
+        success: true, 
+        status: 'Rejected', 
+        booking: updatedBooking,
+        refundStatus: shouldRequestRefund ? 'Requested' : bData.refundStatus || 'Not Requested'
+      });
+    }
+
+    return res.status(400).json({ success: false, error: 'Invalid action. Must be accept or reject.' });
+  } catch (error) {
+    console.error('Vendor Respond Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// D. Admin / Support Refund Processed (External Bank/UPI Confirmation)
 app.post('/api/bookings/:id/refund', async (req, res) => {
   try {
     const { id } = req.params;
-    const { refundAmount, refundId, customer } = req.body;
+    const { refundAmount, refundReference, refundId, customer } = req.body;
 
     const bookingRef = db.collection('bookings').doc(id);
     const bookingDoc = await bookingRef.get();
@@ -811,33 +948,41 @@ app.post('/api/bookings/:id/refund', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Booking not found.' });
     }
 
+    const bData = bookingDoc.data();
+    const finalRefundAmt = Number(refundAmount) || bData.refundAmount || bData.finalPrice || bData.totalPrice || 0;
+
     const refundData = {
       refundId: refundId || `rfd_${Date.now()}`,
-      amount: Number(refundAmount) || bookingDoc.data().refundAmount || 0,
-      processedAt: new Date().toISOString()
+      refundReference: refundReference || `REF_${Date.now()}`,
+      amount: finalRefundAmt,
+      status: 'Processed',
+      processedAt: new Date().toISOString(),
+      processedBy: 'support@parvaevents.com'
     };
 
     await bookingRef.set({
       refundStatus: 'Processed',
+      refundProcessedAt: new Date().toISOString(),
+      refundReference: refundData.refundReference,
       refundData
     }, { merge: true });
 
     // Trigger Refund Email
     sendRefundProcessedEmail({
       db,
-      booking: bookingDoc.data(),
-      customer: customer || { name: bookingDoc.data().customerName || 'Customer', email: bookingDoc.data().customerEmail },
+      booking: bData,
+      customer: customer || { name: bData.customerName || 'Customer', email: bData.customerEmail },
       refundData
     }).catch(err => console.error("Refund email error:", err));
 
-    res.json({ success: true, refundData });
+    res.json({ success: true, refundStatus: 'Processed', refundData });
   } catch (error) {
     console.error('Process Refund Error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
-});
 
 // ==================== 3. ADMIN EMAIL LOGS & TEST ROUTES ====================
+
 
 app.get('/api/admin/email-logs', async (req, res) => {
   try {
