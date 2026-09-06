@@ -10,6 +10,11 @@ import { v2 as cloudinary } from 'cloudinary';
 import admin from 'firebase-admin';
 import { DEFAULT_CATEGORIES, DEFAULT_PROMOS, DEFAULT_VENDORS } from './seedData.js';
 import { generateBookingPdf } from './services/pdfService.js';
+import { calculateBookingPrice } from './services/pricingEngine.js';
+import { checkAvailability, createSlotHold, releaseSlotHold } from './services/availabilityEngine.js';
+import { validateBookingTransition, BOOKING_STATES, checkIdempotency, saveIdempotency } from './services/bookingStateMachine.js';
+import { calculateRefund } from './services/refundEngine.js';
+
 import { calculateVendorCommission } from './services/commissionService.js';
 import {
   sendBookingCreatedEmail,
@@ -81,15 +86,19 @@ cloudinary.config({
 
 const app = express();
 
-// Secure CORS - Allow local frontend, admin portal, and deployed origins
+// Secure CORS - Allow local frontend, vendor app, admin portal, and deployed origins
 const allowedOrigins = [
   'http://localhost:3000',
+  'http://localhost:3001',
   'http://localhost:5173',
   'http://localhost:5000',
   'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001',
   'http://127.0.0.1:5173',
-  process.env.APP_URL || 'https://parava-frontend.onrender.com'
-];
+  process.env.APP_URL || 'https://parava-frontend.onrender.com',
+  process.env.VENDOR_APP_URL,
+  process.env.ADMIN_APP_URL
+].filter(Boolean);
 
 app.use(cors({
   origin: function (origin, callback) {
@@ -152,6 +161,133 @@ app.use((req, res, next) => {
     return res.status(500).json({ error: 'Database not initialized. Missing Service Account.' });
   }
   next();
+});
+
+
+// ==================== AUTHORITATIVE DOMAIN ENDPOINTS ====================
+
+// 1. Authoritative Pricing Quote Generator
+app.post('/api/pricing/quote', async (req, res) => {
+  try {
+    const { vendor, service, selectedPackage, selectedAddons, guestCount, extraHours, durationDays, couponCode } = req.body;
+    if (!vendor || !service) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_INPUT', message: 'Both vendor and service payloads are required' }
+      });
+    }
+
+    let coupon = null;
+    if (couponCode && db) {
+      const couponDoc = await db.collection('coupons').doc(couponCode.toUpperCase()).get();
+      if (couponDoc.exists) {
+        coupon = couponDoc.data();
+      }
+    }
+
+    const priceSnapshot = calculateBookingPrice({
+      vendor,
+      service,
+      selectedPackage,
+      selectedAddons,
+      guestCount,
+      extraHours,
+      durationDays,
+      coupon
+    });
+
+    return res.json({ success: true, data: priceSnapshot });
+  } catch (error) {
+    console.error('[Pricing API Error]:', error.message);
+    return res.status(400).json({
+      success: false,
+      error: { code: 'PRICING_CALCULATION_ERROR', message: error.message }
+    });
+  }
+});
+
+// 2. Authoritative Availability Checker
+app.post('/api/availability/check', async (req, res) => {
+  try {
+    const { vendorId, eventDate, eventTimeSlot } = req.body;
+    if (!vendorId || !eventDate) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_INPUT', message: 'vendorId and eventDate are required' }
+      });
+    }
+
+    let vendor = null;
+    let existingBookings = [];
+
+    if (db) {
+      const vendorDoc = await db.collection('vendors').doc(vendorId).get();
+      if (vendorDoc.exists) {
+        vendor = vendorDoc.data();
+        vendor.id = vendorDoc.id;
+      }
+      const bookingsSnap = await db.collection('bookings')
+        .where('vendorId', '==', vendorId)
+        .where('eventDate', '==', eventDate)
+        .get();
+      bookingsSnap.forEach(doc => existingBookings.push(doc.data()));
+    } else {
+      vendor = { id: vendorId, busyDates: [] };
+    }
+
+    const result = checkAvailability({ vendor, eventDate, eventTimeSlot, existingBookings });
+    return res.json({ success: true, data: result });
+  } catch (error) {
+    console.error('[Availability API Error]:', error.message);
+    return res.status(400).json({
+      success: false,
+      error: { code: 'AVAILABILITY_ERROR', message: error.message }
+    });
+  }
+});
+
+// 3. Atomic Temporary Slot Hold
+app.post('/api/bookings/hold', async (req, res) => {
+  try {
+    const { vendorId, eventDate, eventTimeSlot, customerUid } = req.body;
+    if (!vendorId || !eventDate) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_INPUT', message: 'vendorId, eventDate, and customerUid are required' }
+      });
+    }
+
+    const holdResult = createSlotHold({ vendorId, eventDate, eventTimeSlot, customerUid });
+    return res.json({ success: true, data: holdResult });
+  } catch (error) {
+    console.error('[Slot Hold API Error]:', error.message);
+    return res.status(409).json({
+      success: false,
+      error: { code: 'SLOT_HOLD_CONFLICT', message: error.message }
+    });
+  }
+});
+
+// 4. Refund Policy Estimator
+app.post('/api/bookings/refund-estimate', async (req, res) => {
+  try {
+    const { booking, reason, cancelledBy } = req.body;
+    if (!booking) {
+      return res.status(400).json({
+        success: false,
+        error: { code: 'INVALID_INPUT', message: 'Booking record is required' }
+      });
+    }
+
+    const refundDetails = calculateRefund({ booking, reason, cancelledBy });
+    return res.json({ success: true, data: refundDetails });
+  } catch (error) {
+    console.error('[Refund Estimator Error]:', error.message);
+    return res.status(400).json({
+      success: false,
+      error: { code: 'REFUND_ESTIMATE_ERROR', message: error.message }
+    });
+  }
 });
 
 // ==================== 1. CASHFREE PAYMENT & VERIFICATION ROUTES ====================
