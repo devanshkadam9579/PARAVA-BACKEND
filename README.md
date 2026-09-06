@@ -53,8 +53,8 @@ git push -u origin main
 
 ### Step 3: Add Environment Variables
 Under the **Environment** tab, add the following variables:
-- `RAZORPAY_KEY_ID`: `rzp_test_TE7IEPsVrpMrj7`
-- `RAZORPAY_KEY_SECRET`: `BTTxm1K1lZj7VeTKlDdYYeYO`
+- `RAZORPAY_KEY_ID`: 
+- `RAZORPAY_KEY_SECRET`: 
 - `NODE_ENV`: `production`
 
 Click **Create Web Service** to start the deployment. Once done, Render will provide you with a live URL (e.g., `https://parava-backend.onrender.com`).
