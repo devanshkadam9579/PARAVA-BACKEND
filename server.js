@@ -23,6 +23,8 @@ import {
   sendRefundProcessedEmail,
   sendIdempotentEmail
 } from './services/emailService.js';
+import { requestIdMiddleware, securityHeadersMiddleware, rateLimiter, structuredLogger } from './middleware/securityMiddleware.js';
+import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 
 dotenv.config();
 
@@ -100,12 +102,20 @@ const allowedOrigins = [
   process.env.ADMIN_APP_URL
 ].filter(Boolean);
 
+app.use(requestIdMiddleware);
+app.use(securityHeadersMiddleware);
+app.use(structuredLogger);
+
 app.use(cors({
   origin: function (origin, callback) {
     if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.onrender.com') || origin.endsWith('.vercel.app')) {
       callback(null, true);
     } else {
-      callback(null, true); // Permissive in dev/sandbox
+      if (process.env.NODE_ENV === 'production') {
+        callback(new Error('CORS_ORIGIN_NOT_ALLOWED'));
+      } else {
+        callback(null, true); // Permissive in dev/sandbox
+      }
     }
   },
   credentials: true
@@ -116,8 +126,31 @@ app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 const PORT = process.env.PORT || 5000;
 
+// ==================== HEALTH & OBSERVABILITY ENDPOINTS ====================
+app.get(['/health', '/api/health'], (req, res) => {
+  res.json({
+    status: 'HEALTHY',
+    service: 'PARVA-BACKEND',
+    version: '2.0.0',
+    timestamp: new Date().toISOString(),
+    uptimeSeconds: Math.floor(process.uptime()),
+    environment: process.env.NODE_ENV || 'development',
+    database: db ? 'CONNECTED' : 'DISCONNECTED',
+    gateway: 'CASHFREE',
+    cashfreeEnv: process.env.CASHFREE_ENV === 'PRODUCTION' ? 'PRODUCTION' : 'SANDBOX',
+    requestId: req.id
+  });
+});
+
+// Rate limiter for payment & booking mutations
+const apiMutationLimiter = rateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 60,
+  message: 'Too many operations in a short period. Please wait a moment.'
+});
+
 // ==================== CLOUDINARY DIRECT UPLOAD ROUTE ====================
-app.post('/api/upload/image', async (req, res) => {
+app.post('/api/upload/image', rateLimiter({ windowMs: 60 * 1000, maxRequests: 20 }), async (req, res) => {
   try {
     const { image, folder = 'parva_vendors' } = req.body;
     if (!image) {
@@ -157,7 +190,7 @@ app.get('/', (req, res) => {
 
 // Middleware to check DB
 app.use((req, res, next) => {
-  if (!db && req.path.startsWith('/api/')) {
+  if (!db && req.path.startsWith('/api/') && !req.path.startsWith('/api/health')) {
     return res.status(500).json({ error: 'Database not initialized. Missing Service Account.' });
   }
   next();
@@ -1483,6 +1516,10 @@ app.post('/api/admin/cities', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+// Production Error and 404 Handlers
+app.use(notFoundHandler);
+app.use(errorHandler);
 
 app.listen(PORT, () => {
   console.log(`PARVA Backend & Resend Email Service listening on port ${PORT}`);
