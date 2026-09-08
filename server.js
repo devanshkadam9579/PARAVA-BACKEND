@@ -16,6 +16,7 @@ import { validateBookingTransition, BOOKING_STATES, checkIdempotency, saveIdempo
 import { calculateRefund } from './services/refundEngine.js';
 
 import { calculateVendorCommission } from './services/commissionService.js';
+import { telegramService, TELEGRAM_ALERT_TYPES } from './services/telegramService.js';
 import {
   sendBookingCreatedEmail,
   sendPaymentAndBookingConfirmedEmails,
@@ -218,6 +219,21 @@ app.post('/api/pricing/quote', async (req, res) => {
       }
     }
 
+    let commissionPercentage = 10;
+    let bookingFeePercentage = 5;
+    if (db) {
+      try {
+        const settingsDoc = await db.collection('settings').doc('global').get();
+        if (settingsDoc.exists) {
+          const sData = settingsDoc.data();
+          if (sData.commissionPercentage !== undefined) commissionPercentage = Number(sData.commissionPercentage);
+          if (sData.bookingFeePercentage !== undefined) bookingFeePercentage = Number(sData.bookingFeePercentage);
+        }
+      } catch (e) {
+        console.warn('[Pricing Quote] Could not fetch settings/global:', e);
+      }
+    }
+
     const priceSnapshot = calculateBookingPrice({
       vendor,
       service,
@@ -226,7 +242,9 @@ app.post('/api/pricing/quote', async (req, res) => {
       guestCount,
       extraHours,
       durationDays,
-      coupon
+      coupon,
+      commissionPercentage,
+      bookingFeePercentage
     });
 
     return res.json({ success: true, data: priceSnapshot });
@@ -454,21 +472,15 @@ async function handleCreateCashfreeOrder(req, res) {
           const settingsDoc = await db.collection('settings').doc('global').get();
           if (settingsDoc.exists) {
             const sData = settingsDoc.data();
-            if (sData.bookingFeePercentage) bookingFeePct = Number(sData.bookingFeePercentage);
-            if (sData.commissionPercentage) commissionPct = Number(sData.commissionPercentage);
+            if (sData.bookingFeePercentage !== undefined) bookingFeePct = Number(sData.bookingFeePercentage);
+            if (sData.commissionPercentage !== undefined) commissionPct = Number(sData.commissionPercentage);
           }
         } catch (e) {
           console.warn("[Cashfree Order] Could not fetch settings:", e);
         }
       }
 
-      // Calculate Advance Booking Fee (e.g. 5% of service total)
-      rawBookingFee = Math.round((servicesTotal * bookingFeePct) / 100);
-      if (rawBookingFee <= 0) rawBookingFee = Math.round((servicesTotal * 0.05));
-      gstAmount = Math.round(rawBookingFee * 0.18);
-      const subtotalBeforeCoupon = rawBookingFee + gstAmount;
-
-      // 3. Authoritative Coupon Verification
+      // 3. Authoritative Coupon Verification & Discount Calculation (Reduces Subtotal)
       if (couponCode && db) {
         try {
           const cleanCode = String(couponCode).trim().toUpperCase();
@@ -479,15 +491,15 @@ async function handleCreateCashfreeOrder(req, res) {
             const meetsMinSpend = !cData.minSpend || (servicesTotal >= Number(cData.minSpend));
 
             if (cData.active !== false && isNotExpired && meetsMinSpend) {
-              if (cData.discountType === 'percentage' || cData.discount) {
-                const pct = Number(cData.discountValue || cData.discount || 0);
-                let disc = Math.round((subtotalBeforeCoupon * pct) / 100);
+              if (cData.discountType === 'percentage' || cData.discountPercent || (cData.discount && !cData.discountAmount)) {
+                const pct = Number(cData.discountPercent || cData.discountValue || cData.discount || 0);
+                let disc = Math.round((servicesTotal * pct) / 100);
                 if (cData.maxDiscount && disc > Number(cData.maxDiscount)) {
                   disc = Number(cData.maxDiscount);
                 }
                 couponDiscount = disc;
               } else {
-                couponDiscount = Number(cData.discountValue || cData.discount || 0);
+                couponDiscount = Number(cData.discountAmount || cData.discountValue || cData.discount || 0);
               }
             }
           }
@@ -496,14 +508,24 @@ async function handleCreateCashfreeOrder(req, res) {
         }
       }
 
-      finalPayable = Math.max(1, subtotalBeforeCoupon - couponDiscount);
+      // Discounted Subtotal (never negative)
+      const discountedSubtotal = Math.max(0, servicesTotal - couponDiscount);
+
+      // Calculate Advance Booking Fee (e.g. 5% of discounted subtotal)
+      rawBookingFee = Math.round((discountedSubtotal * bookingFeePct) / 100);
+      if (rawBookingFee <= 0) rawBookingFee = Math.round((discountedSubtotal * 0.05));
+      gstAmount = Math.round(rawBookingFee * 0.18);
+      finalPayable = Math.max(1, rawBookingFee + gstAmount);
     } else {
       return res.status(400).json({ success: false, error: 'Invalid payment type requested.' });
     }
 
-    // 4. Calculate Protected Commission Breakdown
-    let commissionPct = 10;
-    const commissionData = calculateVendorCommission(servicesTotal, { commissionPercentage: commissionPct });
+    // 4. Calculate Protected Commission Breakdown with Dynamic Admin Commission
+    const commissionData = calculateVendorCommission({
+      subtotal: servicesTotal,
+      discount: couponDiscount,
+      commissionPercentage: commissionPct
+    });
 
     // 5. Generate Deterministic Cashfree Order
     const sanitizedPhone = String(customerPhone).replace(/\D/g, '').slice(-10) || '9999999999';
@@ -553,6 +575,7 @@ async function handleCreateCashfreeOrder(req, res) {
       paymentSessionId: orderData.payment_session_id,
       amount: finalPayable,
       servicesTotal,
+      discountedSubtotal: Math.max(0, servicesTotal - couponDiscount),
       bookingFee: rawBookingFee,
       gstAmount,
       couponDiscount,
@@ -659,7 +682,14 @@ async function handleVerifyCashfreePayment(req, res) {
     }
 
     const payableAmount = Number(paymentDetails?.payment_amount || totalAmount || 0);
-    const commissionData = calculateVendorCommission(payableAmount, { commissionPercentage: commissionPct });
+    const bookingSubtotal = Number(bookingData?.totalPrice || bookingData?.pricing?.subtotal || payableAmount);
+    const bookingDiscount = Number(bookingData?.pricing?.discount || 0);
+
+    const commissionData = calculateVendorCommission({
+      subtotal: bookingSubtotal,
+      discount: bookingDiscount,
+      commissionPercentage: commissionPct
+    });
 
     // 4. Save Authoritative Transaction
     const transactionData = {
@@ -684,10 +714,22 @@ async function handleVerifyCashfreePayment(req, res) {
       await db.collection('transactions').doc(transactionId).set(transactionData);
     }
 
-    // 5. Update / Confirm Booking Document
+    // 5. Update / Confirm Booking Document with Immutable Pricing Snapshot
     let confirmedBooking = null;
     if (bookingData) {
       const bookingId = bookingData.id || `b_${orderId}`;
+      const pricingSnapshot = bookingData.pricing || {
+        subtotal: bookingSubtotal,
+        discount: bookingDiscount,
+        discountedSubtotal: Math.max(0, bookingSubtotal - bookingDiscount),
+        commissionPercentage: commissionPct,
+        commissionAmount: commissionData.platformCommission,
+        advanceAmount: payableAmount,
+        remainingAmount: Math.max(0, (bookingSubtotal - bookingDiscount) - (payableAmount / 1.18)),
+        vendorPayout: commissionData.vendorPayout,
+        finalPrice: bookingSubtotal - bookingDiscount
+      };
+
       confirmedBooking = {
         ...bookingData,
         id: bookingId,
@@ -697,6 +739,7 @@ async function handleVerifyCashfreePayment(req, res) {
         transactionId,
         paymentId: transactionData.paymentId,
         orderId: orderId,
+        pricing: pricingSnapshot,
         commissionBreakdown: commissionData,
         termsVersion,
         termsAcceptedAt: new Date().toISOString(),
@@ -705,6 +748,21 @@ async function handleVerifyCashfreePayment(req, res) {
 
       if (db) {
         await db.collection('bookings').doc(bookingId).set(confirmedBooking, { merge: true });
+
+        // Trigger Operational Telegram Alert
+        try {
+          telegramService.sendAlert(TELEGRAM_ALERT_TYPES.NEW_BOOKING, {
+            bookingId,
+            vendorName: confirmedBooking.vendor?.name || 'Partner',
+            category: confirmedBooking.vendor?.category || 'Celebration',
+            eventDate: confirmedBooking.eventDate || 'N/A',
+            eventTimeSlot: confirmedBooking.eventTimeSlot || 'N/A',
+            totalAmountINR: confirmedBooking.totalPrice || pricingSnapshot.finalPrice || payableAmount,
+            advancePaidINR: payableAmount
+          }).catch(tgErr => console.warn('[Telegram Alert Warning]:', tgErr.message));
+        } catch (tgEx) {
+          console.warn('[Telegram Exception]:', tgEx);
+        }
 
         // Double Booking Prevention: Atomically append event date to vendor's busyDates
         if (bookingData.vendor?.id && bookingData.eventDate) {

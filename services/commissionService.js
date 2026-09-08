@@ -1,24 +1,40 @@
 /**
- * Calculates dynamic commission, taxes, and vendor net payout
- * @param {number} totalAmount Total booking value in INR
- * @param {Object} config Admin configurable settings
+ * PARVA PLATFORM — DYNAMIC VENDOR COMMISSION SERVICE
+ * Version 2.0.0
+ * 
+ * Rules:
+ * - Dynamic Admin commission percentage from settings/global.commissionPercentage
+ * - Commission calculated on discounted subtotal (after valid coupon discount)
+ * - Vendor net payout and platform revenue snapshot
+ * - Never hardcoded
  */
-export function calculateVendorCommission(totalAmount, config = {}) {
-  const amount = Number(totalAmount) || 0;
-  const commissionPct = Number(config.commissionPercentage) || 10; // Default 10%
-  const fixedFee = Number(config.fixedCommissionFee) || 0;
-  const taxRate = Number(config.taxRate) || 0.18; // 18% GST on platform fee
 
-  // Commission calculation
-  const percentageFee = Math.round((amount * commissionPct) / 100);
+export function calculateVendorCommission({
+  subtotal = 0,
+  discount = 0,
+  commissionPercentage = 10,
+  fixedCommissionFee = 0,
+  taxRate = 0.18
+} = {}) {
+  const numSubtotal = Math.max(0, Number(subtotal) || 0);
+  const numDiscount = Math.max(0, Number(discount) || 0);
+  const discountedSubtotal = Math.max(0, numSubtotal - numDiscount);
+  const commissionPct = typeof commissionPercentage === 'number' ? commissionPercentage : (Number(commissionPercentage) || 10);
+  const fixedFee = Number(fixedCommissionFee) || 0;
+  const numTaxRate = Number(taxRate) || 0.18;
+
+  // Percentage platform commission
+  const percentageFee = Math.round((discountedSubtotal * commissionPct) / 100);
   const platformCommission = percentageFee + fixedFee;
-  const gstOnCommission = Math.round(platformCommission * taxRate * 100) / 100;
+  const gstOnCommission = Math.round(platformCommission * numTaxRate * 100) / 100;
   
-  // Net payout to vendor
-  const vendorPayout = Math.max(0, amount - platformCommission);
+  // Net payout to vendor on event day
+  const vendorPayout = Math.max(0, discountedSubtotal - platformCommission);
 
   return {
-    totalBookingAmount: amount,
+    subtotal: numSubtotal,
+    discount: numDiscount,
+    discountedSubtotal,
     commissionPercentage: commissionPct,
     platformCommission,
     gstOnCommission,
