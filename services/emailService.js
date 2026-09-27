@@ -251,6 +251,9 @@ export async function sendPaymentAndBookingConfirmedEmails({ db, booking, custom
   const timeSlotFormatted = formatTimeSlot(booking.eventTimeSlot);
   const amountPaid = transaction?.totalAmount || booking.finalPrice || booking.totalPrice || 0;
   const paymentId = transaction?.paymentId || 'PAY_SUCCESS';
+  const eventAddress = booking.eventLocationAddress || customer.eventLocationAddress || vendor.location || 'Maharashtra, India';
+  const customerAge = booking.customerAge || customer.age || 'N/A';
+  const styleNotes = booking.styleSuggestions || booking.notes || 'None specified';
 
   // Customer Email (Confirmation + Receipt + PDF Attachment)
   const customerHtml = getEmailLayout({
@@ -267,7 +270,9 @@ export async function sendPaymentAndBookingConfirmedEmails({ db, booking, custom
         <div class="info-row"><span class="info-label">Service & Vendor:</span><span class="info-value">${vendor.name} (${vendor.category})</span></div>
         <div class="info-row"><span class="info-label">Event Date:</span><span class="info-value">${bookingDate}</span></div>
         <div class="info-row"><span class="info-label">Time Slot:</span><span class="info-value font-bold" style="color: #9d174d;">${timeSlotFormatted}</span></div>
-        <div class="info-row"><span class="info-label">Location / City:</span><span class="info-value">${vendor.location || 'Kolhapur'}</span></div>
+        <div class="info-row"><span class="info-label">Event Venue Address:</span><span class="info-value font-bold">${eventAddress}</span></div>
+        ${booking.eventLocationCoords ? `<div class="info-row"><span class="info-label">GPS Coordinates:</span><span class="info-value" style="font-family: monospace;">Lat ${booking.eventLocationCoords.lat}, Lng ${booking.eventLocationCoords.lng}</span></div>` : ''}
+        ${styleNotes && styleNotes !== 'None specified' ? `<div class="info-row"><span class="info-label">Style / Custom Notes:</span><span class="info-value">${styleNotes}</span></div>` : ''}
         <div class="info-row"><span class="info-label">Amount Paid:</span><span class="info-value amount-highlight">₹${Number(amountPaid).toLocaleString('en-IN')}</span></div>
         <div class="info-row"><span class="info-label">Payment Status:</span><span class="info-value" style="color: #059669;">✓ Verified (Paid)</span></div>
       </div>
@@ -317,14 +322,18 @@ export async function sendPaymentAndBookingConfirmedEmails({ db, booking, custom
       contentHtml: `
         <h2 style="font-size: 20px; font-weight: 800; color: #059669; margin-top: 0;">New Confirmed Booking Received! 💰</h2>
         <p style="color: #475569; font-size: 14px;">Hi <strong>${v.vendorName || vendor.name}</strong>,</p>
-        <p style="color: #475569; font-size: 14px;">Customer <strong>${customer.name}</strong> has paid and confirmed their reservation for your service.</p>
+        <p style="color: #475569; font-size: 14px;">Customer <strong>${customer.name}</strong> (Age: ${customerAge}) has paid and confirmed their reservation for your service.</p>
         
         <div class="info-card">
           <div class="info-row"><span class="info-label">Booking Reference:</span><span class="info-value">#${bookingId}</span></div>
-          <div class="info-row"><span class="info-label">Customer Name:</span><span class="info-value">${customer.name}</span></div>
-          <div class="info-row"><span class="info-label">Customer Contact:</span><span class="info-value">${customer.phone || 'Available in Vendor Hub'}</span></div>
+          <div class="info-row"><span class="info-label">Customer Name:</span><span class="info-value">${customer.name} (Age: ${customerAge})</span></div>
+          <div class="info-row"><span class="info-label">Customer Contact:</span><span class="info-value font-bold" style="color: #9d174d;">${customer.phone || 'Available in Vendor Hub'}</span></div>
+          <div class="info-row"><span class="info-label">Customer Email:</span><span class="info-value">${customer.email || 'N/A'}</span></div>
           <div class="info-row"><span class="info-label">Event Date:</span><span class="info-value">${bookingDate}</span></div>
           <div class="info-row"><span class="info-label">Time Slot:</span><span class="info-value font-bold" style="color: #9d174d;">${timeSlotFormatted}</span></div>
+          <div class="info-row"><span class="info-label">Event Venue Address:</span><span class="info-value font-bold">${eventAddress}</span></div>
+          ${booking.eventLocationCoords ? `<div class="info-row"><span class="info-label">GPS Coordinates:</span><span class="info-value" style="font-family: monospace;">Lat ${booking.eventLocationCoords.lat}, Lng ${booking.eventLocationCoords.lng}</span></div>` : ''}
+          ${styleNotes && styleNotes !== 'None specified' ? `<div class="info-row"><span class="info-label">Style / Custom Suggestions:</span><span class="info-value">${styleNotes}</span></div>` : ''}
           <div class="info-row"><span class="info-label">Gross Booking Value:</span><span class="info-value">₹${Number(amountPaid).toLocaleString('en-IN')}</span></div>
           <div class="info-row"><span class="info-label">Platform Commission:</span><span class="info-value" style="color: #64748b;">- ₹${Number(platformCommission).toLocaleString('en-IN')}</span></div>
           <div class="info-row"><span class="info-label">Net Vendor Payout:</span><span class="info-value amount-highlight">₹${Number(vendorPayout).toLocaleString('en-IN')}</span></div>
