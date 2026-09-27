@@ -362,6 +362,8 @@ async function handleCreateCashfreeOrder(req, res) {
       eventTimeSlot = 'full_day'
     } = req.body;
 
+    const orderId = req.body.orderId || `PRV_ORD_${Date.now()}_${Math.floor(1000 + Math.random() * 9000)}`;
+
     let servicesTotal = 0;
     let rawBookingFee = 0;
     let gstAmount = 0;
@@ -530,7 +532,6 @@ async function handleCreateCashfreeOrder(req, res) {
     // 5. Generate Deterministic Cashfree Order
     const sanitizedPhone = String(customerPhone).replace(/\D/g, '').slice(-10) || '9999999999';
     const sanitizedCustomerId = String(userId || 'guest_user').replace(/[^a-zA-Z0-9_-]/g, '_');
-    const orderId = `PRV_ORD_${Date.now()}_${Math.floor(1000 + Math.random() * 9000)}`;
 
     const orderPayload = {
       order_id: orderId,
