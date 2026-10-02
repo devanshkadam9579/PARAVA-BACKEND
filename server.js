@@ -25,6 +25,7 @@ import {
   sendIdempotentEmail
 } from './services/emailService.js';
 import { requestIdMiddleware, securityHeadersMiddleware, rateLimiter, structuredLogger } from './middleware/securityMiddleware.js';
+import { verifyAuth, verifyOptionalAuth, requireAdmin, requireVendor } from './middleware/authMiddleware.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 
 dotenv.config();
@@ -66,25 +67,22 @@ const db = admin.apps.length > 0
   ? (config.firestoreDatabaseId ? getFirestore(admin.apps[0], config.firestoreDatabaseId) : admin.firestore())
   : null;
 
-// Initialize Cashfree Payments PG SDK
+// Initialize Cashfree Payments PG SDK with sanitized environment variables
 import { Cashfree, CFEnvironment } from 'cashfree-pg';
 
 const cashfree = new Cashfree(
   process.env.CASHFREE_ENV === 'PRODUCTION' ? CFEnvironment.PRODUCTION : CFEnvironment.SANDBOX,
-  process.env.CASHFREE_APP_ID || 'TEST111841318a08c860af55e862516f13148111',
-  process.env.CASHFREE_SECRET_KEY || 'cfsk_ma_test_cb126d43432b695f46b3a42cadaa997c_2f8bf785'
+  process.env.CASHFREE_APP_ID || '',
+  process.env.CASHFREE_SECRET_KEY || ''
 );
 
 console.log(`[Cashfree] Initialized in ${process.env.CASHFREE_ENV === 'PRODUCTION' ? 'PRODUCTION' : 'SANDBOX'} mode. Client ID: ${cashfree.XClientId ? cashfree.XClientId.substring(0, 8) + '...' : 'None'}`);
 
-
-
-
-// Initialize Cloudinary SDK
+// Initialize Cloudinary SDK with sanitized environment variables
 cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || 'k03rmhkg',
-  api_key: process.env.CLOUDINARY_API_KEY || '354754454388942',
-  api_secret: process.env.CLOUDINARY_API_SECRET || 'VJnWw6rsG05nPmBLOiUS5r0VDPw'
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || '',
+  api_key: process.env.CLOUDINARY_API_KEY || '',
+  api_secret: process.env.CLOUDINARY_API_SECRET || ''
 });
 
 const app = express();
@@ -93,14 +91,21 @@ const app = express();
 const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:3001',
-  'http://localhost:5173',
   'http://localhost:5000',
+  'http://localhost:5173',
+  'http://localhost:5174',
   'http://127.0.0.1:3000',
   'http://127.0.0.1:3001',
   'http://127.0.0.1:5173',
-  process.env.APP_URL || 'https://parava-frontend.onrender.com',
+  'http://127.0.0.1:5174',
+  process.env.APP_URL,
   process.env.VENDOR_APP_URL,
-  process.env.ADMIN_APP_URL
+  process.env.ADMIN_APP_URL,
+  'https://parava-frontend.onrender.com',
+  'https://parva-vendor-app.onrender.com',
+  'https://parva-admin.onrender.com',
+  'https://myparva.com',
+  'https://www.myparva.com'
 ].filter(Boolean);
 
 app.use(requestIdMiddleware);
@@ -109,7 +114,7 @@ app.use(structuredLogger);
 
 app.use(cors({
   origin: function (origin, callback) {
-    if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.onrender.com') || origin.endsWith('.vercel.app')) {
+    if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.onrender.com') || origin.endsWith('.vercel.app') || origin.endsWith('myparva.com')) {
       callback(null, true);
     } else {
       if (process.env.NODE_ENV === 'production') {
@@ -151,7 +156,7 @@ const apiMutationLimiter = rateLimiter({
 });
 
 // ==================== CLOUDINARY DIRECT UPLOAD ROUTE ====================
-app.post('/api/upload/image', rateLimiter({ windowMs: 60 * 1000, maxRequests: 20 }), async (req, res) => {
+app.post('/api/upload/image', rateLimiter({ windowMs: 60 * 1000, maxRequests: 20 }), verifyAuth, async (req, res) => {
   try {
     const { image, folder = 'parva_vendors' } = req.body;
     if (!image) {
@@ -529,9 +534,10 @@ async function handleCreateCashfreeOrder(req, res) {
       commissionPercentage: commissionPct
     });
 
-    // 5. Generate Deterministic Cashfree Order
+    // 5. Generate Deterministic Cashfree Order with Verified Customer Identity
+    const finalUserId = req.user?.uid || (userId && userId !== 'guest-uid' ? userId : `guest_${Date.now()}`);
     const sanitizedPhone = String(customerPhone).replace(/\D/g, '').slice(-10) || '9999999999';
-    const sanitizedCustomerId = String(userId || 'guest_user').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const sanitizedCustomerId = String(finalUserId).replace(/[^a-zA-Z0-9_-]/g, '_');
 
     const orderPayload = {
       order_id: orderId,
@@ -540,7 +546,7 @@ async function handleCreateCashfreeOrder(req, res) {
       customer_details: {
         customer_id: sanitizedCustomerId,
         customer_name: customerName || 'Parva Customer',
-        customer_email: customerEmail && customerEmail.includes('@') ? customerEmail : 'customer@parvaevents.com',
+        customer_email: (req.user?.email || customerEmail) && (req.user?.email || customerEmail).includes('@') ? (req.user?.email || customerEmail) : 'customer@parvaevents.com',
         customer_phone: sanitizedPhone.length === 10 ? sanitizedPhone : '9999999999'
       },
       order_meta: {
@@ -593,9 +599,9 @@ async function handleCreateCashfreeOrder(req, res) {
 }
 
 
-// Register both /api/payments/cashfree/create-order and /api/payments/initiate for smooth transition
-app.post('/api/payments/cashfree/create-order', handleCreateCashfreeOrder);
-app.post('/api/payments/initiate', handleCreateCashfreeOrder);
+// Register both /api/payments/cashfree/create-order and /api/payments/initiate with verifyOptionalAuth
+app.post('/api/payments/cashfree/create-order', verifyOptionalAuth, handleCreateCashfreeOrder);
+app.post('/api/payments/initiate', verifyOptionalAuth, handleCreateCashfreeOrder);
 
 /**
  * Verifies Cashfree payment status server-side and atomically confirms booking
@@ -941,9 +947,9 @@ async function handleVerifyCashfreePayment(req, res) {
   }
 }
 
-// Register both /api/payments/cashfree/verify and /api/payments/verify
-app.post('/api/payments/cashfree/verify', handleVerifyCashfreePayment);
-app.post('/api/payments/verify', handleVerifyCashfreePayment);
+// Register both /api/payments/cashfree/verify and /api/payments/verify with verifyOptionalAuth
+app.post('/api/payments/cashfree/verify', verifyOptionalAuth, handleVerifyCashfreePayment);
+app.post('/api/payments/verify', verifyOptionalAuth, handleVerifyCashfreePayment);
 
 // ==================== CASHFREE WEBHOOK LISTENER ====================
 app.post('/api/payments/cashfree/webhook', async (req, res) => {
@@ -1005,7 +1011,7 @@ app.post('/api/payments/cashfree/webhook', async (req, res) => {
 });
 
 // ==================== 2. CASHFREE REAL REFUND API ROUTE ====================
-app.post('/api/payments/cashfree/refund', async (req, res) => {
+app.post('/api/payments/cashfree/refund', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const { orderId, refundAmount, refundNote = 'Customer refund requested', bookingId } = req.body;
 
@@ -1070,15 +1076,19 @@ app.post('/api/payments/cashfree/refund', async (req, res) => {
 // ==================== 2. BOOKING CREATION, CANCELLATION & REFUND ROUTES ====================
 
 // A. Booking Created (Pending Request)
-app.post('/api/bookings/create', async (req, res) => {
+app.post('/api/bookings/create', verifyOptionalAuth, async (req, res) => {
   try {
     const { booking, customer, vendor } = req.body;
     if (!booking || !booking.id) {
       return res.status(400).json({ success: false, error: 'Booking details required.' });
     }
 
+    const assignedUserId = req.user?.uid || booking.userId || booking.customerUid || null;
+
     const pendingBooking = {
       ...booking,
+      userId: assignedUserId,
+      customerUid: assignedUserId,
       status: booking.status || 'Pending',
       paymentStatus: booking.paymentStatus || 'Pending',
       createdAt: new Date().toISOString()
@@ -1102,7 +1112,7 @@ app.post('/api/bookings/create', async (req, res) => {
 });
 
 // B. Booking Cancellation (Customer Requested with Support-Managed Refund Engine)
-app.post('/api/bookings/:id/cancel', async (req, res) => {
+app.post('/api/bookings/:id/cancel', verifyAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const { reason = 'Customer requested cancellation', refundAmount = 0, customer, vendor } = req.body;
@@ -1115,6 +1125,20 @@ app.post('/api/bookings/:id/cancel', async (req, res) => {
     }
 
     const bData = bookingDoc.data();
+
+    // Authoritative Ownership Check: Must be customer, assigned vendor, or admin
+    const callerUid = req.user.uid;
+    const isCustomer = (bData.userId && bData.userId === callerUid) || (bData.customerUid && bData.customerUid === callerUid);
+    const isVendor = (bData.vendorId && bData.vendorId === callerUid) || (bData.vendor?.id && bData.vendor.id === callerUid) || (bData.vendorOwnerUid && bData.vendorOwnerUid === callerUid);
+    const isAdmin = Boolean(req.user.isAdmin);
+
+    if (!isCustomer && !isVendor && !isAdmin) {
+      return res.status(403).json({
+        success: false,
+        error: { code: 'FORBIDDEN', message: 'You are not authorized to cancel this booking.' }
+      });
+    }
+
     const isPaid = bData.paymentStatus === 'Paid';
     const currentRefundStatus = bData.refundStatus;
     
@@ -1130,7 +1154,7 @@ app.post('/api/bookings/:id/cancel', async (req, res) => {
       ...(shouldRequestRefund ? {
         refundStatus: 'Requested',
         refundRequestedAt: new Date().toISOString(),
-        refundRequestedBy: 'customer',
+        refundRequestedBy: isCustomer ? 'customer' : 'vendor',
         refundReason: reason,
         refundAmount: calculatedRefundAmt
       } : {})
@@ -1148,13 +1172,35 @@ app.post('/api/bookings/:id/cancel', async (req, res) => {
       refundAmount: calculatedRefundAmt
     }).catch(err => console.error("Cancellation email error:", err));
 
-    // In-App Broadcast Notification
-    await db.collection('broadcast_notifications').add({
-      title: `⚠️ Booking Cancelled: #${id}`,
-      message: `Booking for ${updatedBooking.vendor?.name || 'Vendor'} has been cancelled.${shouldRequestRefund ? ' Refund request logged for support@parva.com.' : ''}`,
-      type: 'system',
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
+    // Scoped In-App Notification (Customer)
+    const targetCustomerUid = bData.userId || bData.customerUid;
+    if (targetCustomerUid) {
+      await db.collection('notifications').doc(`notif_cancel_${id}_customer`).set({
+        id: `notif_cancel_${id}_customer`,
+        recipientUid: targetCustomerUid,
+        bookingId: id,
+        type: 'slot',
+        title: `⚠️ Booking Cancelled: #${id}`,
+        message: `Booking for ${updatedBooking.vendor?.name || 'Vendor'} has been cancelled.${shouldRequestRefund ? ' Refund request logged.' : ''}`,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        read: false
+      }, { merge: true });
+    }
+
+    // Scoped In-App Notification (Vendor)
+    const targetVendorUid = bData.vendorId || bData.vendor?.id;
+    if (targetVendorUid) {
+      await db.collection('notifications').doc(`notif_cancel_${id}_vendor`).set({
+        id: `notif_cancel_${id}_vendor`,
+        recipientUid: targetVendorUid,
+        bookingId: id,
+        type: 'slot',
+        title: `⚠️ Booking Cancelled: #${id}`,
+        message: `Booking #${id} from ${updatedBooking.customerName || 'Customer'} has been cancelled.`,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        read: false
+      }, { merge: true });
+    }
 
     res.json({ 
       success: true, 
@@ -1169,13 +1215,13 @@ app.post('/api/bookings/:id/cancel', async (req, res) => {
 });
 
 // C. Vendor Respond (Accept / Reject Flow with Authorization)
-app.post('/api/vendor/bookings/:id/respond', async (req, res) => {
+app.post('/api/vendor/bookings/:id/respond', verifyAuth, requireVendor, async (req, res) => {
   try {
     const { id } = req.params;
     const { action, vendorId, reason } = req.body; // action = 'accept' | 'reject'
 
-    if (!id || !action || !vendorId) {
-      return res.status(400).json({ success: false, error: 'Booking ID, vendorId, and action (accept/reject) are required.' });
+    if (!id || !action) {
+      return res.status(400).json({ success: false, error: 'Booking ID and action (accept/reject) are required.' });
     }
 
     const bookingRef = db.collection('bookings').doc(id);
@@ -1186,12 +1232,6 @@ app.post('/api/vendor/bookings/:id/respond', async (req, res) => {
     }
 
     const bData = bookingDoc.data();
-    
-    // Strict Vendor Authorization Check
-    const bookingVendorId = bData.vendor?.id || bData.vendorId;
-    if (bookingVendorId !== vendorId) {
-      return res.status(403).json({ success: false, error: 'Unauthorized: You can only respond to your own vendor bookings.' });
-    }
 
     if (action === 'accept') {
       const updatedBooking = {
@@ -1202,13 +1242,20 @@ app.post('/api/vendor/bookings/:id/respond', async (req, res) => {
 
       await bookingRef.set(updatedBooking, { merge: true });
 
-      // Notify customer that vendor accepted
-      await db.collection('broadcast_notifications').add({
-        title: `🎉 Vendor Confirmed: #${id}`,
-        message: `${bData.vendor?.name || 'Your vendor'} has accepted your event booking!`,
-        type: 'booking_accepted',
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
+      // Notify customer that vendor accepted (Scoped Notification)
+      const targetCustomerUid = bData.userId || bData.customerUid;
+      if (targetCustomerUid) {
+        await db.collection('notifications').doc(`notif_accept_${id}_customer`).set({
+          id: `notif_accept_${id}_customer`,
+          recipientUid: targetCustomerUid,
+          bookingId: id,
+          type: 'slot',
+          title: `🎉 Vendor Confirmed: #${id}`,
+          message: `${bData.vendor?.name || 'Your vendor'} has accepted your event booking!`,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          read: false
+        }, { merge: true });
+      }
 
       return res.json({ success: true, status: 'Confirmed', booking: updatedBooking });
     } else if (action === 'reject') {
@@ -1232,13 +1279,20 @@ app.post('/api/vendor/bookings/:id/respond', async (req, res) => {
 
       await bookingRef.set(updatedBooking, { merge: true });
 
-      // Notify customer that vendor declined
-      await db.collection('broadcast_notifications').add({
-        title: `⚠️ Vendor Declined: #${id}`,
-        message: `${bData.vendor?.name || 'The vendor'} was unable to accept this booking. ${shouldRequestRefund ? 'Your advance fee refund request has been created.' : ''}`,
-        type: 'booking_rejected',
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
+      // Notify customer that vendor declined (Scoped Notification)
+      const targetCustomerUid = bData.userId || bData.customerUid;
+      if (targetCustomerUid) {
+        await db.collection('notifications').doc(`notif_reject_${id}_customer`).set({
+          id: `notif_reject_${id}_customer`,
+          recipientUid: targetCustomerUid,
+          bookingId: id,
+          type: 'slot',
+          title: `⚠️ Vendor Declined: #${id}`,
+          message: `${bData.vendor?.name || 'The vendor'} was unable to accept this booking. ${shouldRequestRefund ? 'Your advance fee refund request has been created.' : ''}`,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          read: false
+        }, { merge: true });
+      }
 
       return res.json({ 
         success: true, 
@@ -1256,7 +1310,7 @@ app.post('/api/vendor/bookings/:id/respond', async (req, res) => {
 });
 
 // D. Admin / Support Refund Processed (External Bank/UPI Confirmation)
-app.post('/api/bookings/:id/refund', async (req, res) => {
+app.post('/api/bookings/:id/refund', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { refundAmount, refundReference, refundId, customer } = req.body;
@@ -1305,9 +1359,7 @@ app.post('/api/bookings/:id/refund', async (req, res) => {
 
 // ==================== 3. ADMIN EMAIL LOGS & TEST ROUTES ====================
 
-
-
-app.get('/api/admin/email-logs', async (req, res) => {
+app.get('/api/admin/email-logs', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const snap = await db.collection('email_events').orderBy('sentAt', 'desc').limit(50).get();
     const logs = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -1318,7 +1370,7 @@ app.get('/api/admin/email-logs', async (req, res) => {
   }
 });
 
-app.post('/api/admin/email-logs/retry', async (req, res) => {
+app.post('/api/admin/email-logs/retry', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const { logId } = req.body;
     const logRef = db.collection('email_events').doc(logId);
@@ -1345,7 +1397,7 @@ app.post('/api/admin/email-logs/retry', async (req, res) => {
   }
 });
 
-app.post('/api/email/test', async (req, res) => {
+app.post('/api/email/test', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const { to = 'devanshkadam2@gmail.com' } = req.body;
     const result = await sendIdempotentEmail({
@@ -1375,10 +1427,19 @@ app.post('/api/email/test', async (req, res) => {
 
 // ==================== 4. EXISTING ADMIN & SYSTEM ROUTES ====================
 
-app.post('/api/admin/sync-user', async (req, res) => {
+// Authoritative Sync User: Derives UID and Email strictly from verified Firebase token
+app.post('/api/admin/sync-user', verifyAuth, async (req, res) => {
   try {
-    const { uid, email, name } = req.body;
-    const adminEmails = ['devenshkadam2@gmail.com', 'devanshkadam2@gmail.com'];
+    const uid = req.user.uid;
+    const email = (req.user.email || '').toLowerCase().trim();
+    const name = req.user.name || req.body.name || 'Admin';
+    const adminEmails = [
+      'devenshkadam2@gmail.com',
+      'devanshkadam2@gmail.com',
+      'devansh@parva.com',
+      'admin@myparva.com',
+      'rohan@myparva.com'
+    ];
     
     if (adminEmails.includes(email)) {
       if (db) {
@@ -1387,19 +1448,28 @@ app.post('/api/admin/sync-user', async (req, res) => {
           email,
           name,
           role: 'master_admin',
-          city: 'Mumbai'
+          city: 'Mumbai',
+          syncedAt: new Date().toISOString()
+        }, { merge: true });
+
+        await db.collection('admins').doc(uid).set({
+          uid,
+          email,
+          name,
+          role: 'master_admin',
+          updatedAt: new Date().toISOString()
         }, { merge: true });
       }
-      return res.json({ success: true });
+      return res.json({ success: true, role: 'master_admin' });
     }
-    return res.status(403).json({ success: false, error: 'Not authorized' });
+    return res.status(403).json({ success: false, error: 'Not authorized for master administrator synchronization.' });
   } catch (err) {
     console.error("Sync User Error:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-app.get('/api/admin/dashboard', async (req, res) => {
+app.get('/api/admin/dashboard', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const usersSnap = await db.collection('users').get();
     const totalUsers = usersSnap.size;
@@ -1450,7 +1520,7 @@ app.get('/api/admin/dashboard', async (req, res) => {
   }
 });
 
-app.post('/api/admin/categories', async (req, res) => {
+app.post('/api/admin/categories', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const { id, name, icon, iconName, image } = req.body;
     if (!id || !name) {
@@ -1471,7 +1541,7 @@ app.post('/api/admin/categories', async (req, res) => {
   }
 });
 
-app.delete('/api/admin/categories/:id', async (req, res) => {
+app.delete('/api/admin/categories/:id', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     await db.collection('categories').doc(id).delete();
@@ -1482,7 +1552,7 @@ app.delete('/api/admin/categories/:id', async (req, res) => {
   }
 });
 
-app.post('/api/admin/settings', async (req, res) => {
+app.post('/api/admin/settings', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const { docId = 'global', data } = req.body;
     await db.collection('settings').doc(docId).set(data, { merge: true });
@@ -1493,7 +1563,7 @@ app.post('/api/admin/settings', async (req, res) => {
   }
 });
 
-app.post('/api/admin/reset-defaults', async (req, res) => {
+app.post('/api/admin/reset-defaults', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const categoriesSnap = await db.collection('categories').get();
     for (const docSnap of categoriesSnap.docs) {
@@ -1542,7 +1612,7 @@ app.post('/api/admin/reset-defaults', async (req, res) => {
 // ==================== 5. ADMIN MANAGEMENT ROUTES (BROADCAST, COUPONS, CITIES) ====================
 
 // A. Broadcast Notification Route
-app.post('/api/admin/broadcast', async (req, res) => {
+app.post('/api/admin/broadcast', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const { title, message, type = 'offer', imageUrl, actionText = 'View Details' } = req.body;
     if (!title || !message) {
@@ -1566,7 +1636,7 @@ app.post('/api/admin/broadcast', async (req, res) => {
 });
 
 // B. Coupons CRUD Routes
-app.get('/api/admin/coupons', async (req, res) => {
+app.get('/api/admin/coupons', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const snap = await db.collection('coupons').get();
     const coupons = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -1577,7 +1647,7 @@ app.get('/api/admin/coupons', async (req, res) => {
   }
 });
 
-app.post('/api/admin/coupons', async (req, res) => {
+app.post('/api/admin/coupons', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const { code, discount, type = 'percentage', maxDiscount, minSpend, expiryDate, active = true } = req.body;
     if (!code || !discount) {
@@ -1605,7 +1675,7 @@ app.post('/api/admin/coupons', async (req, res) => {
   }
 });
 
-app.delete('/api/admin/coupons/:id', async (req, res) => {
+app.delete('/api/admin/coupons/:id', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     await db.collection('coupons').doc(id).delete();
@@ -1616,7 +1686,7 @@ app.delete('/api/admin/coupons/:id', async (req, res) => {
   }
 });
 
-// C. Cities Operations Route
+// C. Cities Operations Route (Public Read, Admin Write)
 app.get('/api/admin/cities', async (req, res) => {
   try {
     const docSnap = await db.collection('settings').doc('cities').get();
@@ -1628,7 +1698,7 @@ app.get('/api/admin/cities', async (req, res) => {
   }
 });
 
-app.post('/api/admin/cities', async (req, res) => {
+app.post('/api/admin/cities', verifyAuth, requireAdmin, async (req, res) => {
   try {
     const { blockedCities } = req.body;
     await db.collection('settings').doc('cities').set({
