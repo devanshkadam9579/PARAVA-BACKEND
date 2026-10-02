@@ -51,7 +51,7 @@ export function rateLimiter({ windowMs = 60 * 1000, maxRequests = 100, message =
     }
 
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown-ip';
-    const key = ${ip}:;
+    const key = `${ip}`;
     const now = Date.now();
 
     let record = rateLimitMap.get(key);
@@ -104,7 +104,7 @@ export function structuredLogger(req, res, next) {
     } else if (res.statusCode >= 400) {
       console.warn('[API_WARN]', JSON.stringify(logEntry));
     } else {
-      console.log('[API_INFO]', ${logEntry.method}   in ms []);
+      console.log('[API_INFO]', `${logEntry.method} ${logEntry.path} ${logEntry.statusCode} in ${durationMs}ms`);
     }
   });
 

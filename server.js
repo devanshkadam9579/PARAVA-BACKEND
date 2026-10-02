@@ -370,6 +370,8 @@ async function handleCreateCashfreeOrder(req, res) {
     let couponDiscount = 0;
     let finalPayable = 0;
     let vendorData = null;
+    let bookingFeePct = 5;
+    let commissionPct = 10;
 
     if (type === 'connection') {
       const connectionFee = 499;
@@ -467,8 +469,6 @@ async function handleCreateCashfreeOrder(req, res) {
 
 
       // 2. Fetch Admin Global Settings (Booking Fee % and Commission %)
-      let bookingFeePct = 5;
-      let commissionPct = 10;
       if (db) {
         try {
           const settingsDoc = await db.collection('settings').doc('global').get();
@@ -619,6 +619,21 @@ async function handleVerifyCashfreePayment(req, res) {
 
     console.log(`[Cashfree] Verifying payment for Order ID: ${orderId}...`);
 
+    // Verify authenticated customer token from request header if present
+    let authenticatedCustomerUid = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split('Bearer ')[1];
+      try {
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        authenticatedCustomerUid = decodedToken.uid;
+        console.log(`[Cashfree Verify] Authenticated customer UID verified: ${authenticatedCustomerUid}`);
+      } catch (authErr) {
+        console.warn('[Cashfree Verify] Token verification notice:', authErr.message);
+      }
+    }
+    const finalUserId = authenticatedCustomerUid || userId || customerData?.uid || bookingData?.userId || bookingData?.customerUid || 'guest-uid';
+
     // 1. Fetch Order Payments from Cashfree API
     let paymentVerified = false;
     let paymentDetails = null;
@@ -626,7 +641,6 @@ async function handleVerifyCashfreePayment(req, res) {
     try {
       const fetchResponse = await cashfree.PGOrderFetchPayments(orderId);
       const payments = fetchResponse.data;
-
 
       if (Array.isArray(payments) && payments.length > 0) {
         const successPayment = payments.find(p => p.payment_status === 'SUCCESS');
@@ -658,12 +672,19 @@ async function handleVerifyCashfreePayment(req, res) {
       if (existingTxn.exists) {
         console.log(`[Cashfree] Idempotency: Order ${orderId} already processed.`);
         const existingBookingId = bookingData?.id || `b_${orderId}`;
-        const existingBookingDoc = await db.collection('bookings').doc(existingBookingId).get();
+        let existingBookingDoc = await db.collection('bookings').doc(existingBookingId).get();
+        let existingBookingData = existingBookingDoc.exists ? existingBookingDoc.data() : null;
+        if (!existingBookingData) {
+          const snap = await db.collection('bookings').where('orderId', '==', orderId).limit(1).get();
+          if (!snap.empty) {
+            existingBookingData = snap.docs[0].data();
+          }
+        }
         return res.json({ 
           success: true, 
           idempotent: true,
           transaction: existingTxn.data(), 
-          booking: existingBookingDoc.exists ? existingBookingDoc.data() : null 
+          booking: existingBookingData 
         });
       }
     }
@@ -696,7 +717,8 @@ async function handleVerifyCashfreePayment(req, res) {
     const transactionData = {
       id: transactionId,
       provider: 'CASHFREE',
-      userId: userId || 'Guest',
+      userId: finalUserId,
+      customerUid: finalUserId,
       vendorId: vendorId || bookingData?.vendor?.id || 'System',
       type: type || 'booking',
       orderId: orderId,
@@ -734,6 +756,8 @@ async function handleVerifyCashfreePayment(req, res) {
       confirmedBooking = {
         ...bookingData,
         id: bookingId,
+        userId: finalUserId,
+        customerUid: finalUserId,
         provider: 'CASHFREE',
         paymentStatus: 'Paid',
         status: 'Confirmed',
@@ -851,14 +875,56 @@ async function handleVerifyCashfreePayment(req, res) {
           commissionData
         }).catch(err => console.error('[Cashfree] Email Automation Error:', err));
 
-        // Real-time Push / In-App Notification
-        await db.collection('broadcast_notifications').add({
-          title: `🎉 Booking Confirmed: #${bookingId}`,
-          message: `Booking verified with ${bookingData.vendor?.name || 'Vendor'} for ${bookingData.eventDate}. Receipt sent to your email!`,
-          type: 'slot',
-          vendorId: bookingData.vendor?.id,
-          createdAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+        // Scoped & Idempotent Push / In-App Notifications
+        const customerUid = finalUserId;
+        if (customerUid && customerUid !== 'Guest' && customerUid !== 'guest-uid') {
+          await db.collection('notifications').doc(`notif_${bookingId}_customer`).set({
+            id: `notif_${bookingId}_customer`,
+            recipientUid: customerUid,
+            bookingId,
+            vendorId: bookingData.vendor?.id || vendorId,
+            type: 'BOOKING_CONFIRMED',
+            title: `🎉 Booking Confirmed: #${bookingId}`,
+            message: `Your celebration service with ${bookingData.vendor?.name || 'Vendor'} is confirmed for ${bookingData.eventDate}. Receipt sent to your email!`,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            read: false
+          }, { merge: true });
+        }
+
+        const vendorUid = bookingData.vendor?.id || vendorId;
+        if (vendorUid) {
+          await db.collection('notifications').doc(`notif_${bookingId}_vendor`).set({
+            id: `notif_${bookingId}_vendor`,
+            recipientUid: vendorUid,
+            bookingId,
+            vendorId: vendorUid,
+            type: 'BOOKING_RECEIVED',
+            title: `🔔 New Booking Received: #${bookingId}`,
+            message: `New booking confirmed from ${customer.name} for ${bookingData.eventDate}. Advance paid: ₹${payableAmount}.`,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            read: false
+          }, { merge: true });
+        }
+
+        // Operational Admin Financial Notification
+        await db.collection('notifications').doc(`notif_${bookingId}_admin`).set({
+          id: `notif_${bookingId}_admin`,
+          recipientUid: 'admin',
+          bookingId,
+          vendorId: bookingData.vendor?.id || vendorId,
+          type: 'ADMIN_BOOKING_ALERT',
+          title: `💰 New Confirmed Booking: #${bookingId}`,
+          message: `Customer ${customer.name} booked ${vendor.name} for ₹${payableAmount}. Platform fee/commission: ₹${commissionData.platformCommission} (${commissionPct}%).`,
+          financial: {
+            grossAmount: payableAmount,
+            commissionPercentage: commissionPct,
+            commissionAmount: commissionData.platformCommission,
+            vendorPayout: commissionData.vendorPayout,
+            gatewayOrderId: orderId
+          },
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          read: false
+        }, { merge: true });
       }
     }
 

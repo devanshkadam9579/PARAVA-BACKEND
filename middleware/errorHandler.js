@@ -39,7 +39,7 @@ export function notFoundHandler(req, res) {
     success: false,
     error: {
       code: 'ROUTE_NOT_FOUND',
-      message: The requested endpoint   was not found on this server.,
+      message: `The requested endpoint ${req.originalUrl || req.path} was not found on this server.`,
       requestId: req.id
     }
   });
