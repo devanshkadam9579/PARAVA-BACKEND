@@ -1,52 +1,102 @@
 export const DEFAULT_CATEGORIES = [
   {
-    id: 'wedding',
-    name: 'Wedding',
-    iconName: 'Heart',
-    image: 'https://images.unsplash.com/photo-1511795409834-ef04bbd61622?auto=format&fit=crop&q=80&w=400'
+    id: 'banquet-hall',
+    name: 'Venues',
+    iconName: 'Building2',
+    image: 'https://images.unsplash.com/photo-1519167758481-83f550bb49b3?auto=format&fit=crop&q=80&w=600',
+    description: 'Luxury banquet halls, lush green lawns, and heritage celebration pavilions',
+    displayOrder: 1,
+    status: 'active',
+    services: ['AC Ballroom Rental', 'Open Lawn & Garden', 'Bridal Suite', 'Valet Parking']
   },
   {
-    id: 'birthday',
-    name: 'Birthday',
-    iconName: 'Cake',
-    image: 'https://images.unsplash.com/photo-1530103862676-de8c9debad1d?auto=format&fit=crop&q=80&w=400'
-  },
-  {
-    id: 'corporate',
-    name: 'Corporate',
-    iconName: 'Briefcase',
-    image: 'https://images.unsplash.com/photo-1511578314322-379afb476865?auto=format&fit=crop&q=80&w=400'
-  },
-  {
-    id: 'festival',
-    name: 'Festival',
+    id: 'decorator',
+    name: 'Decorators',
     iconName: 'Sparkles',
-    image: 'https://images.unsplash.com/photo-1514525253161-7a46d19cd819?auto=format&fit=crop&q=80&w=400'
+    image: 'https://images.unsplash.com/photo-1522413416052-4065f8a8de35?auto=format&fit=crop&q=80&w=600',
+    description: 'Bespoke floral setups, stage lighting, mandap designs, and entrance tunnels',
+    displayOrder: 2,
+    status: 'active',
+    services: ['Floral Mandap & Stage', 'Neon Photo Booth', 'Glasshouse Theme', 'Fairy Lights Draping']
   },
   {
-    id: 'housewarming',
-    name: 'Housewarming',
-    iconName: 'Home',
-    image: 'https://images.unsplash.com/photo-1513694203232-719a280e022f?auto=format&fit=crop&q=80&w=400'
+    id: 'photographer',
+    name: 'Photography',
+    iconName: 'Camera',
+    image: 'https://images.unsplash.com/photo-1516035069371-29a1b244cc32?auto=format&fit=crop&q=80&w=600',
+    description: 'Cinematic 4K wedding films, candid photojournalism, and aerial drone coverage',
+    displayOrder: 3,
+    status: 'active',
+    services: ['Full Day 4K Video & Candid', 'Drone Aerial Highlights', 'Pre-Wedding Shoot', 'Handcrafted Album']
   },
   {
-    id: 'engagement',
-    name: 'Engagement',
-    iconName: 'Gift',
-    image: 'https://images.unsplash.com/photo-1515934751635-c81c6bc9a2d8?auto=format&fit=crop&q=80&w=400'
+    id: 'dj',
+    name: 'DJ & Sound',
+    iconName: 'Music',
+    image: 'https://images.unsplash.com/photo-1516450360452-9312f5e86fc7?auto=format&fit=crop&q=80&w=600',
+    description: 'Concert-grade sound systems, intelligent moving head lights, and celebrity DJs',
+    displayOrder: 4,
+    status: 'active',
+    services: ['Sangeet & Party DJ Set', 'Line Array Concert Audio', 'Cold Pyro & Fog Machines', 'LED Wall Stage Rigging']
   },
   {
-    id: 'anniversary',
-    name: 'Anniversary',
-    iconName: 'Award',
-    image: 'https://images.unsplash.com/photo-1469371670807-013ccf25f16a?auto=format&fit=crop&q=80&w=400'
+    id: 'catering',
+    name: 'Catering',
+    iconName: 'Utensils',
+    image: 'https://images.unsplash.com/photo-1555244162-803834f70033?auto=format&fit=crop&q=80&w=600',
+    description: 'Curated royal multi-cuisine feasts, gourmet live chaat, and high-tea spreads',
+    displayOrder: 5,
+    status: 'active',
+    services: ['Royal Multi-Cuisine Buffet', 'Live Gourmet Chaat Counter', 'Signature Mocktail Bar', 'Dessert & Ice Cream Parlour']
   },
   {
-    id: 'baby-shower',
-    name: 'Baby Shower',
-    iconName: 'Smile',
-    image: 'https://images.unsplash.com/photo-1519689680058-324335c77eb2?auto=format&fit=crop&q=80&w=400'
+    id: 'makeup-artist',
+    name: 'Makeup Artists',
+    iconName: 'Palette',
+    image: 'https://images.unsplash.com/photo-1487412720507-e7ab37603c6f?auto=format&fit=crop&q=80&w=600',
+    description: 'Airbrush HD bridal artistry, hair styling, saree draping, and grooming',
+    displayOrder: 6,
+    status: 'active',
+    services: ['HD Bridal Airbrush Makeover', 'Reception Glam & Hair Styling', 'Family Draping & Touch-up', 'Pre-Bridal Skincare']
+  },
+  {
+    id: 'cake-desserts',
+    name: 'Cake & Desserts',
+    iconName: 'Cake',
+    image: 'https://images.unsplash.com/photo-1535141192574-5d4897c13636?auto=format&fit=crop&q=80&w=600',
+    description: 'Architectural tiered wedding cakes, French macarons, and dessert tables',
+    displayOrder: 7,
+    status: 'active',
+    services: ['Multi-Tier Fondant Cake', 'Artisanal Macaron Tower', 'Live Belgian Waffle Counter', 'Bespoke Sweet Gifting Boxes']
+  },
+  {
+    id: 'event-planner',
+    name: 'Event Planners',
+    iconName: 'ClipboardList',
+    image: 'https://images.unsplash.com/photo-1511795409834-ef04bbd61622?auto=format&fit=crop&q=80&w=600',
+    description: 'End-to-end wedding, corporate, and milestone celebration coordinators',
+    displayOrder: 8,
+    status: 'active',
+    services: ['Complete Wedding Coordination', 'Vendor Hospitality Management', 'Budget & Timeline Planning', 'On-Day Stage Direction']
   }
+];
+
+export const DEFAULT_OPERATIONAL_CITIES = [
+  'Kolhapur',
+  'Pune',
+  'Nagpur',
+  'Nashik',
+  'Mumbai',
+  'Delhi NCR',
+  'Bangalore',
+  'Hyderabad',
+  'Chennai',
+  'Kolkata',
+  'Jaipur',
+  'Ahmedabad',
+  'Lucknow',
+  'Satara',
+  'Sangli'
 ];
 
 export const DEFAULT_PROMOS = [

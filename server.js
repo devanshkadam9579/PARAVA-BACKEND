@@ -8,7 +8,7 @@ import crypto from 'crypto';
 import Razorpay from 'razorpay';
 import { v2 as cloudinary } from 'cloudinary';
 import admin from 'firebase-admin';
-import { DEFAULT_CATEGORIES, DEFAULT_PROMOS, DEFAULT_VENDORS } from './seedData.js';
+import { DEFAULT_CATEGORIES, DEFAULT_OPERATIONAL_CITIES, DEFAULT_PROMOS, DEFAULT_VENDORS } from './seedData.js';
 import { generateBookingPdf } from './services/pdfService.js';
 import { calculateBookingPrice } from './services/pricingEngine.js';
 import { checkAvailability, createSlotHold, releaseSlotHold } from './services/availabilityEngine.js';
@@ -1522,18 +1522,31 @@ app.get('/api/admin/dashboard', verifyAuth, requireAdmin, async (req, res) => {
 
 app.post('/api/admin/categories', verifyAuth, requireAdmin, async (req, res) => {
   try {
-    const { id, name, icon, iconName, image } = req.body;
-    if (!id || !name) {
-      return res.status(400).json({ success: false, error: 'Category ID and Name are required.' });
+    const { id, name, icon, iconName, image, status = 'active', displayOrder = 100, description = '', services = [] } = req.body;
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ success: false, error: 'Category Name is required.' });
     }
+    const cleanId = (id || name.toLowerCase().trim().replace(/[^a-z0-9]/g, '-')).toLowerCase().trim();
+    const cleanName = name.trim();
+    const cleanStatus = status === 'inactive' ? 'inactive' : 'active';
+    const cleanOrder = Number(displayOrder) || 100;
+    const cleanServices = Array.isArray(services) ? services.map(s => String(s).trim()).filter(Boolean) : [];
+
     const catData = {
-      id,
-      name,
-      icon: icon || 'Sparkles',
+      id: cleanId,
+      name: cleanName,
+      icon: icon || iconName || 'Sparkles',
       iconName: iconName || icon || 'Sparkles',
-      image: image || 'https://images.unsplash.com/photo-1519167758481-83f550bb49b3?auto=format&fit=crop&q=80&w=400'
+      image: image || 'https://images.unsplash.com/photo-1519167758481-83f550bb49b3?auto=format&fit=crop&q=80&w=400',
+      imageUrl: image || 'https://images.unsplash.com/photo-1519167758481-83f550bb49b3?auto=format&fit=crop&q=80&w=400',
+      status: cleanStatus,
+      displayOrder: cleanOrder,
+      description: String(description || '').trim(),
+      services: cleanServices,
+      updatedAt: new Date().toISOString()
     };
-    await db.collection('categories').doc(id).set(catData, { merge: true });
+
+    await db.collection('categories').doc(cleanId).set(catData, { merge: true });
     res.json({ success: true, category: catData });
   } catch (error) {
     console.error('Admin Add Category Error:', error);
@@ -1690,8 +1703,17 @@ app.delete('/api/admin/coupons/:id', verifyAuth, requireAdmin, async (req, res) 
 app.get('/api/admin/cities', async (req, res) => {
   try {
     const docSnap = await db.collection('settings').doc('cities').get();
-    const data = docSnap.exists ? docSnap.data() : { blockedCities: [] };
-    res.json({ success: true, blockedCities: data.blockedCities || [] });
+    const data = docSnap.exists ? docSnap.data() : {};
+    const operationalCities = Array.isArray(data.operationalCities) && data.operationalCities.length > 0
+      ? data.operationalCities
+      : DEFAULT_OPERATIONAL_CITIES;
+    const blockedCities = Array.isArray(data.blockedCities) ? data.blockedCities : [];
+
+    res.json({
+      success: true,
+      operationalCities,
+      blockedCities
+    });
   } catch (error) {
     console.error('Fetch Cities Error:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -1700,14 +1722,66 @@ app.get('/api/admin/cities', async (req, res) => {
 
 app.post('/api/admin/cities', verifyAuth, requireAdmin, async (req, res) => {
   try {
-    const { blockedCities } = req.body;
+    const { blockedCities, operationalCities } = req.body;
+    const cleanBlocked = Array.isArray(blockedCities) ? blockedCities.map(c => String(c).trim()).filter(Boolean) : [];
+    
+    // If operationalCities is provided, persist it, otherwise preserve existing or default
+    const existingSnap = await db.collection('settings').doc('cities').get();
+    const existingData = existingSnap.exists ? existingSnap.data() : {};
+    const cleanOperational = Array.isArray(operationalCities) && operationalCities.length > 0
+      ? Array.from(new Set(operationalCities.map(c => String(c).trim()).filter(Boolean)))
+      : (Array.isArray(existingData.operationalCities) && existingData.operationalCities.length > 0 ? existingData.operationalCities : DEFAULT_OPERATIONAL_CITIES);
+
     await db.collection('settings').doc('cities').set({
-      blockedCities: blockedCities || [],
+      blockedCities: cleanBlocked,
+      operationalCities: cleanOperational,
       updatedAt: new Date().toISOString()
     }, { merge: true });
-    res.json({ success: true, blockedCities });
+
+    res.json({
+      success: true,
+      operationalCities: cleanOperational,
+      blockedCities: cleanBlocked
+    });
   } catch (error) {
     console.error('Save Cities Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// D. Public Unified Catalog Read Endpoints (Data-Driven Single Source of Truth)
+app.get('/api/catalog/categories', async (req, res) => {
+  try {
+    const snap = await db.collection('categories').get();
+    let categories = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    if (categories.length === 0) {
+      categories = DEFAULT_CATEGORIES;
+    }
+    // Filter active categories and sort by displayOrder
+    const activeCategories = categories
+      .filter(c => c.status !== 'inactive')
+      .sort((a, b) => (Number(a.displayOrder) || 100) - (Number(b.displayOrder) || 100));
+
+    res.json({ success: true, categories: activeCategories });
+  } catch (error) {
+    console.error('Catalog Categories Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/catalog/cities', async (req, res) => {
+  try {
+    const docSnap = await db.collection('settings').doc('cities').get();
+    const data = docSnap.exists ? docSnap.data() : {};
+    const operational = Array.isArray(data.operationalCities) && data.operationalCities.length > 0
+      ? data.operationalCities
+      : DEFAULT_OPERATIONAL_CITIES;
+    const blocked = Array.isArray(data.blockedCities) ? data.blockedCities : [];
+    const activeCities = operational.filter(city => !blocked.includes(city));
+
+    res.json({ success: true, cities: activeCities, allOperational: operational, blocked });
+  } catch (error) {
+    console.error('Catalog Cities Error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
