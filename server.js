@@ -545,7 +545,10 @@ async function handleCreateCashfreeOrder(req, res) {
     });
 
     // 5. Generate Deterministic Cashfree Order with Verified Customer Identity
-    const finalUserId = req.user?.uid || (userId && userId !== 'guest-uid' ? userId : `guest_${Date.now()}`);
+    const finalUserId = req.user?.uid;
+    if (!finalUserId) {
+      return res.status(401).json({ success: false, error: 'Authentication required. Please sign in to create a booking order.' });
+    }
     const sanitizedPhone = String(customerPhone).replace(/\D/g, '').slice(-10) || '9999999999';
     const sanitizedCustomerId = String(finalUserId).replace(/[^a-zA-Z0-9_-]/g, '_');
 
@@ -609,9 +612,9 @@ async function handleCreateCashfreeOrder(req, res) {
 }
 
 
-// Register both /api/payments/cashfree/create-order and /api/payments/initiate with verifyOptionalAuth
-app.post('/api/payments/cashfree/create-order', verifyOptionalAuth, handleCreateCashfreeOrder);
-app.post('/api/payments/initiate', verifyOptionalAuth, handleCreateCashfreeOrder);
+// Register both /api/payments/cashfree/create-order and /api/payments/initiate with strict authentication
+app.post('/api/payments/cashfree/create-order', verifyAuth, handleCreateCashfreeOrder);
+app.post('/api/payments/initiate', verifyAuth, handleCreateCashfreeOrder);
 
 /**
  * Verifies Cashfree payment status server-side and atomically confirms booking
@@ -636,10 +639,10 @@ async function handleVerifyCashfreePayment(req, res) {
     console.log(`[Cashfree] Verifying payment for Order ID: ${orderId}...`);
 
     // Verify authenticated customer token from request header if present
-    let authenticatedCustomerUid = null;
+    let authenticatedCustomerUid = req.user?.uid || null;
     const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      const token = authHeader.split('Bearer ')[1];
+    if (!authenticatedCustomerUid && authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split('Bearer ')[1].trim();
       try {
         const decodedToken = await admin.auth().verifyIdToken(token);
         authenticatedCustomerUid = decodedToken.uid;
@@ -648,7 +651,10 @@ async function handleVerifyCashfreePayment(req, res) {
         console.warn('[Cashfree Verify] Token verification notice:', authErr.message);
       }
     }
-    const finalUserId = authenticatedCustomerUid || userId || customerData?.uid || bookingData?.userId || bookingData?.customerUid || 'guest-uid';
+    const finalUserId = authenticatedCustomerUid || req.user?.uid;
+    if (!finalUserId) {
+      return res.status(401).json({ success: false, error: 'Authentication required. Please sign in to verify booking payment.' });
+    }
 
     // 1. Fetch Order Payments from Cashfree API
     let paymentVerified = false;
@@ -957,9 +963,9 @@ async function handleVerifyCashfreePayment(req, res) {
   }
 }
 
-// Register both /api/payments/cashfree/verify and /api/payments/verify with verifyOptionalAuth
-app.post('/api/payments/cashfree/verify', verifyOptionalAuth, handleVerifyCashfreePayment);
-app.post('/api/payments/verify', verifyOptionalAuth, handleVerifyCashfreePayment);
+// Register both /api/payments/cashfree/verify and /api/payments/verify with strict authentication
+app.post('/api/payments/cashfree/verify', verifyAuth, handleVerifyCashfreePayment);
+app.post('/api/payments/verify', verifyAuth, handleVerifyCashfreePayment);
 
 // ==================== CASHFREE WEBHOOK LISTENER ====================
 app.post('/api/payments/cashfree/webhook', async (req, res) => {
@@ -1085,15 +1091,15 @@ app.post('/api/payments/cashfree/refund', verifyAuth, requireAdmin, async (req, 
 
 // ==================== 2. BOOKING CREATION, CANCELLATION & REFUND ROUTES ====================
 
-// A. Booking Created (Pending Request)
-app.post('/api/bookings/create', verifyOptionalAuth, async (req, res) => {
+// A. Booking Created (Pending Request - Authenticated Customer Required)
+app.post('/api/bookings/create', verifyAuth, async (req, res) => {
   try {
     const { booking, customer, vendor } = req.body;
     if (!booking || !booking.id) {
       return res.status(400).json({ success: false, error: 'Booking details required.' });
     }
 
-    const assignedUserId = req.user?.uid || booking.userId || booking.customerUid || null;
+    const assignedUserId = req.user.uid;
 
     const pendingBooking = {
       ...booking,
@@ -1117,6 +1123,64 @@ app.post('/api/bookings/create', verifyOptionalAuth, async (req, res) => {
     res.json({ success: true, booking: pendingBooking });
   } catch (error) {
     console.error('Create Booking Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// A.1 Submit Customer Review (Authenticated Customer Only)
+app.post('/api/reviews', verifyAuth, async (req, res) => {
+  try {
+    const { bookingId, vendorId, rating, comment } = req.body;
+    if (!vendorId || !rating) {
+      return res.status(400).json({ success: false, error: 'Vendor ID and rating are required.' });
+    }
+
+    const numericRating = Math.min(5, Math.max(1, Number(rating) || 5));
+    const customerUid = req.user.uid;
+    const customerName = req.user.name || req.user.email?.split('@')[0] || 'Verified Customer';
+
+    const reviewId = `rev_${customerUid}_${vendorId}_${Date.now()}`;
+    const reviewData = {
+      id: reviewId,
+      bookingId: bookingId || null,
+      vendorId,
+      customerUid,
+      customerName,
+      userName: customerName,
+      rating: numericRating,
+      comment: (comment || '').trim(),
+      date: new Date().toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' }),
+      createdAt: new Date().toISOString()
+    };
+
+    if (db) {
+      // 1. Save review doc in Firestore
+      await db.collection('reviews').doc(reviewId).set(reviewData);
+
+      // 2. Recalculate Vendor Rating & Review Count
+      const reviewsSnap = await db.collection('reviews').where('vendorId', '==', vendorId).get();
+      if (!reviewsSnap.empty) {
+        let totalStars = 0;
+        const reviewList = [];
+        reviewsSnap.forEach(docSnap => {
+          const r = docSnap.data();
+          totalStars += Number(r.rating) || 5;
+          reviewList.push(r);
+        });
+        const reviewCount = reviewsSnap.size;
+        const avgRating = Number((totalStars / reviewCount).toFixed(1));
+
+        await db.collection('vendors').doc(vendorId).set({
+          rating: avgRating,
+          reviewCount,
+          reviews: reviewList.slice(-10) // keep latest 10 reviews in snapshot
+        }, { merge: true });
+      }
+    }
+
+    res.json({ success: true, review: reviewData });
+  } catch (error) {
+    console.error('Submit Review Error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
