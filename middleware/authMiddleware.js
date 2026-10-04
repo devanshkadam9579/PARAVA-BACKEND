@@ -11,7 +11,9 @@ const AUTHORITATIVE_ADMIN_EMAILS = [
   'devenshkadam2@gmail.com',
   'devansh@parva.com',
   'admin@myparva.com',
-  'rohan@myparva.com'
+  'rohan@myparva.com',
+  'devanshkadam9579@gmail.com',
+  'admin@parva.com'
 ];
 
 /**

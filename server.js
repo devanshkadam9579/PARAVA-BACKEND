@@ -1565,11 +1565,54 @@ app.delete('/api/admin/categories/:id', verifyAuth, requireAdmin, async (req, re
   }
 });
 
+app.get('/api/admin/settings/:docId?', verifyAuth, requireAdmin, async (req, res) => {
+  try {
+    const docId = req.params.docId || 'global';
+    const docSnap = await db.collection('settings').doc(docId).get();
+    if (docSnap.exists) {
+      return res.json({ success: true, settings: docSnap.data() });
+    }
+    // Return standard defaults if not yet created
+    const defaults = {
+      commissionPercentage: 10,
+      fixedCommissionFee: 0,
+      bookingFeePercentage: 5,
+      paymentsEnabled: true,
+      supportEmail: 'support@parva.com',
+      termsVersion: '1.2'
+    };
+    return res.json({ success: true, settings: defaults });
+  } catch (error) {
+    console.error('Admin Get Settings Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.post('/api/admin/settings', verifyAuth, requireAdmin, async (req, res) => {
   try {
-    const { docId = 'global', data } = req.body;
-    await db.collection('settings').doc(docId).set(data, { merge: true });
-    res.json({ success: true, message: 'Settings saved successfully.' });
+    const docId = req.body.docId || 'global';
+    const rawData = req.body.data || req.body;
+    
+    // Sanitize and extract platform policy attributes
+    const settingsData = {
+      ...rawData,
+      commissionPercentage: rawData.commissionPercentage !== undefined ? Number(rawData.commissionPercentage) : 10,
+      fixedCommissionFee: rawData.fixedCommissionFee !== undefined ? Number(rawData.fixedCommissionFee) : 0,
+      bookingFeePercentage: rawData.bookingFeePercentage !== undefined ? Number(rawData.bookingFeePercentage) : 5,
+      paymentsEnabled: rawData.paymentsEnabled !== undefined ? Boolean(rawData.paymentsEnabled) : true,
+      supportEmail: rawData.supportEmail ? String(rawData.supportEmail).trim() : 'support@parva.com',
+      termsVersion: rawData.termsVersion ? String(rawData.termsVersion).trim() : '1.2',
+      updatedAt: new Date().toISOString(),
+      updatedBy: req.user?.email || 'admin'
+    };
+    // Remove docId and data wrapper if present
+    delete settingsData.docId;
+    delete settingsData.data;
+
+    await db.collection('settings').doc(docId).set(settingsData, { merge: true });
+    console.log(`[Admin Settings] Saved settings/${docId}:`, settingsData);
+
+    res.json({ success: true, message: 'Settings saved and published successfully.', settings: settingsData });
   } catch (error) {
     console.error('Admin Save Settings Error:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -1749,7 +1792,31 @@ app.post('/api/admin/cities', verifyAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// D. Public Unified Catalog Read Endpoints (Data-Driven Single Source of Truth)
+// D. Vendor Verification / Status Update Route
+app.patch('/api/admin/vendors/:id/status', verifyAuth, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { approved, verificationStatus, status, rejectionReason } = req.body;
+    const updateData = {
+      updatedAt: new Date().toISOString(),
+      updatedBy: req.user?.email || 'admin'
+    };
+    if (approved !== undefined) updateData.approved = Boolean(approved);
+    if (verificationStatus) updateData.verificationStatus = String(verificationStatus);
+    if (status) updateData.status = String(status);
+    if (rejectionReason !== undefined) updateData.rejectionReason = String(rejectionReason);
+    if (approved === true) updateData.approvedAt = new Date().toISOString();
+    if (approved === false && rejectionReason) updateData.rejectedAt = new Date().toISOString();
+
+    await db.collection('vendors').doc(id).set(updateData, { merge: true });
+    res.json({ success: true, message: `Vendor ${id} status updated successfully.`, vendor: updateData });
+  } catch (error) {
+    console.error('Admin Update Vendor Status Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// E. Public Unified Catalog Read Endpoints (Data-Driven Single Source of Truth)
 app.get('/api/catalog/categories', async (req, res) => {
   try {
     const snap = await db.collection('categories').get();
