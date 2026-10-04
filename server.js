@@ -127,8 +127,8 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(express.json({ limit: '25mb' }));
-app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+app.use(express.json({ limit: '100mb' }));
+app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
 const PORT = process.env.PORT || 5000;
 
@@ -155,33 +155,43 @@ const apiMutationLimiter = rateLimiter({
   message: 'Too many operations in a short period. Please wait a moment.'
 });
 
-// ==================== CLOUDINARY DIRECT UPLOAD ROUTE ====================
-app.post('/api/upload/image', rateLimiter({ windowMs: 60 * 1000, maxRequests: 20 }), verifyAuth, async (req, res) => {
+// ==================== CLOUDINARY DIRECT UPLOAD ROUTE (IMAGE & VIDEO) ====================
+app.post(['/api/upload/image', '/api/upload/media'], rateLimiter({ windowMs: 60 * 1000, maxRequests: 50 }), verifyAuth, async (req, res) => {
   try {
-    const { image, folder = 'parva_vendors' } = req.body;
-    if (!image) {
-      return res.status(400).json({ success: false, error: 'No image data provided.' });
+    const { image, media, folder = 'parva_vendors', resource_type } = req.body;
+    const mediaPayload = image || media;
+    if (!mediaPayload) {
+      return res.status(400).json({ success: false, error: 'No media data provided.' });
     }
 
-    const uploadResponse = await cloudinary.uploader.upload(image, {
-      folder,
-      resource_type: 'image',
-      format: 'webp', // Auto-convert to ultra-compact WebP
-      quality: 'auto:good', // Cloudinary smart compression
-      fetch_format: 'auto'
-    });
+    const isVideo = resource_type === 'video' || 
+                    (typeof mediaPayload === 'string' && (mediaPayload.startsWith('data:video/') || mediaPayload.includes('video/mp4') || mediaPayload.includes('video/webm')));
 
-    console.log(`[Cloudinary] Successfully uploaded image: ${uploadResponse.secure_url}`);
+    const uploadOptions = {
+      folder,
+      resource_type: isVideo ? 'video' : 'image'
+    };
+
+    if (!isVideo) {
+      uploadOptions.format = 'webp';
+      uploadOptions.quality = 'auto:good';
+      uploadOptions.fetch_format = 'auto';
+    }
+
+    const uploadResponse = await cloudinary.uploader.upload(mediaPayload, uploadOptions);
+
+    console.log(`[Cloudinary] Successfully uploaded ${isVideo ? 'video' : 'image'}: ${uploadResponse.secure_url}`);
     res.json({
       success: true,
       url: uploadResponse.secure_url,
       public_id: uploadResponse.public_id,
       format: uploadResponse.format,
+      resource_type: uploadResponse.resource_type || (isVideo ? 'video' : 'image'),
       bytes: uploadResponse.bytes
     });
   } catch (error) {
     console.error('Cloudinary Upload Error:', error);
-    res.status(500).json({ success: false, error: error.message || 'Image upload failed' });
+    res.status(500).json({ success: false, error: error.message || 'Media upload failed' });
   }
 });
 
@@ -1812,6 +1822,80 @@ app.patch('/api/admin/vendors/:id/status', verifyAuth, requireAdmin, async (req,
     res.json({ success: true, message: `Vendor ${id} status updated successfully.`, vendor: updateData });
   } catch (error) {
     console.error('Admin Update Vendor Status Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Admin Vendor Full Management Routes (Authoritative Admin SDK Save / Update)
+app.post(['/api/admin/vendors', '/api/admin/vendors/:id'], verifyAuth, requireAdmin, async (req, res) => {
+  try {
+    const targetId = req.params.id || req.body.id || `vendor-${Date.now()}`;
+    const vendorData = { ...req.body };
+    delete vendorData.id;
+
+    // Sanitize any undefined properties to omit them
+    Object.keys(vendorData).forEach(key => {
+      if (vendorData[key] === undefined) {
+        delete vendorData[key];
+      }
+    });
+
+    vendorData.updatedAt = new Date().toISOString();
+    vendorData.updatedBy = req.user?.email || 'admin';
+
+    await db.collection('vendors').doc(targetId).set(vendorData, { merge: true });
+    console.log(`[Admin] Successfully saved vendor ${targetId}`);
+
+    res.json({
+      success: true,
+      message: `Vendor ${targetId} saved successfully.`,
+      id: targetId,
+      vendor: vendorData
+    });
+  } catch (error) {
+    console.error('Admin Save Vendor Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put('/api/admin/vendors/:id', verifyAuth, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const vendorData = { ...req.body };
+    delete vendorData.id;
+
+    Object.keys(vendorData).forEach(key => {
+      if (vendorData[key] === undefined) {
+        delete vendorData[key];
+      }
+    });
+
+    vendorData.updatedAt = new Date().toISOString();
+    vendorData.updatedBy = req.user?.email || 'admin';
+
+    await db.collection('vendors').doc(id).set(vendorData, { merge: true });
+    console.log(`[Admin] Successfully updated vendor ${id}`);
+
+    res.json({
+      success: true,
+      message: `Vendor ${id} updated successfully.`,
+      id,
+      vendor: vendorData
+    });
+  } catch (error) {
+    console.error('Admin Update Vendor Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/admin/vendors/:id', verifyAuth, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.collection('vendors').doc(id).delete();
+    console.log(`[Admin] Successfully deleted vendor ${id}`);
+    res.json({ success: true, message: `Vendor ${id} deleted successfully.` });
+  } catch (error) {
+    console.error('Admin Delete Vendor Error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
