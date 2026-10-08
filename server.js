@@ -209,6 +209,138 @@ app.get('/', (req, res) => {
   });
 });
 
+function generateBackendVendorSlug(vendor) {
+  if (!vendor || !vendor.name) return 'vendor';
+  const cleanName = vendor.name
+    .toLowerCase()
+    .trim()
+    .replace(/&/g, 'and')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+
+  const locLower = (vendor.location || '').toLowerCase();
+  let cityPart = '';
+  if (locLower.includes('kolhapur')) cityPart = 'kolhapur';
+  else if (locLower.includes('pune')) cityPart = 'pune';
+  else if (locLower.includes('mumbai')) cityPart = 'mumbai';
+  else if (locLower.includes('satara')) cityPart = 'satara';
+  else if (locLower.includes('sangli')) cityPart = 'sangli';
+
+  if (cityPart && !cleanName.includes(cityPart)) {
+    return `${cleanName}-${cityPart}`;
+  }
+  return cleanName;
+}
+
+app.get('/robots.txt', (req, res) => {
+  res.type('text/plain');
+  res.send(`# robots.txt for Parva Events (https://myparva.com)
+User-agent: *
+Allow: /
+Allow: /vendor/
+Allow: /event-vendors-kolhapur
+Allow: /wedding-venues-kolhapur
+Allow: /event-catering-kolhapur
+Allow: /wedding-photographers-kolhapur
+Allow: /event-decorators-kolhapur
+Allow: /dj-sound-services-kolhapur
+Allow: /makeup-artists-kolhapur
+Allow: /event-planners-kolhapur
+Allow: /cake-desserts-kolhapur
+
+Allow: /assets/
+Allow: /hero/
+Allow: /*.js$
+Allow: /*.css$
+Allow: /*.png$
+Allow: /*.jpg$
+Allow: /*.svg$
+Allow: /*.woff$
+Allow: /*.woff2$
+
+Disallow: /admin/
+Disallow: /admin
+Disallow: /checkout
+Disallow: /payment/
+Disallow: /cart
+Disallow: /messages
+Disallow: /chat
+Disallow: /profile
+Disallow: /bookings
+
+Sitemap: https://myparva.com/sitemap.xml
+`);
+});
+
+app.get('/sitemap.xml', async (req, res) => {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const staticRoutes = [
+      { url: 'https://myparva.com/', priority: '1.0', changefreq: 'daily' },
+      { url: 'https://myparva.com/event-vendors-kolhapur', priority: '0.9', changefreq: 'weekly' },
+      { url: 'https://myparva.com/wedding-venues-kolhapur', priority: '0.9', changefreq: 'weekly' },
+      { url: 'https://myparva.com/event-catering-kolhapur', priority: '0.9', changefreq: 'weekly' },
+      { url: 'https://myparva.com/wedding-photographers-kolhapur', priority: '0.9', changefreq: 'weekly' },
+      { url: 'https://myparva.com/event-decorators-kolhapur', priority: '0.9', changefreq: 'weekly' },
+      { url: 'https://myparva.com/dj-sound-services-kolhapur', priority: '0.9', changefreq: 'weekly' },
+      { url: 'https://myparva.com/makeup-artists-kolhapur', priority: '0.9', changefreq: 'weekly' },
+      { url: 'https://myparva.com/event-planners-kolhapur', priority: '0.9', changefreq: 'weekly' },
+      { url: 'https://myparva.com/cake-desserts-kolhapur', priority: '0.9', changefreq: 'weekly' }
+    ];
+
+    let vendorList = [];
+    if (db) {
+      try {
+        const snap = await db.collection('vendors').get();
+        if (!snap.empty) {
+          snap.forEach(d => {
+            const data = d.data();
+            vendorList.push({ id: d.id, ...data });
+          });
+        }
+      } catch (err) {
+        console.warn('[Sitemap] Failed to fetch vendors from DB, using fallback:', err.message);
+      }
+    }
+    if (vendorList.length === 0 && Array.isArray(DEFAULT_VENDORS)) {
+      vendorList = DEFAULT_VENDORS;
+    }
+
+    const seenSlugs = new Set();
+    let xml = `<?xml version="1.0" encoding="UTF-8"?>\n`;
+    xml += `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`;
+
+    for (const r of staticRoutes) {
+      xml += `  <url>\n`;
+      xml += `    <loc>${r.url}</loc>\n`;
+      xml += `    <lastmod>${today}</lastmod>\n`;
+      xml += `    <changefreq>${r.changefreq}</changefreq>\n`;
+      xml += `    <priority>${r.priority}</priority>\n`;
+      xml += `  </url>\n`;
+    }
+
+    for (const v of vendorList) {
+      const slug = generateBackendVendorSlug(v);
+      if (!slug || seenSlugs.has(slug)) continue;
+      seenSlugs.add(slug);
+      xml += `  <url>\n`;
+      xml += `    <loc>https://myparva.com/vendor/${slug}</loc>\n`;
+      xml += `    <lastmod>${today}</lastmod>\n`;
+      xml += `    <changefreq>weekly</changefreq>\n`;
+      xml += `    <priority>0.8</priority>\n`;
+      xml += `  </url>\n`;
+    }
+
+    xml += `</urlset>\n`;
+
+    res.set('Content-Type', 'application/xml; charset=utf-8');
+    res.status(200).send(xml);
+  } catch (error) {
+    console.error('[Sitemap] Generation error:', error);
+    res.status(500).send('Error generating sitemap');
+  }
+});
+
 // Middleware to check DB
 app.use((req, res, next) => {
   if (!db && req.path.startsWith('/api/') && !req.path.startsWith('/api/health')) {
