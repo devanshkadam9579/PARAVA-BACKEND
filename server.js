@@ -5,7 +5,6 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import crypto from 'crypto';
-import Razorpay from 'razorpay';
 import { v2 as cloudinary } from 'cloudinary';
 import admin from 'firebase-admin';
 import { DEFAULT_CATEGORIES, DEFAULT_OPERATIONAL_CITIES, DEFAULT_PROMOS, DEFAULT_VENDORS } from './seedData.js';
@@ -75,8 +74,9 @@ const cashfree = new Cashfree(
   process.env.CASHFREE_APP_ID || '',
   process.env.CASHFREE_SECRET_KEY || ''
 );
+cashfree.XApiVersion = process.env.CASHFREE_API_VERSION || '2023-08-01';
 
-console.log(`[Cashfree] Initialized in ${process.env.CASHFREE_ENV === 'PRODUCTION' ? 'PRODUCTION' : 'SANDBOX'} mode. Client ID: ${cashfree.XClientId ? cashfree.XClientId.substring(0, 8) + '...' : 'None'}`);
+console.log(`[Cashfree] Initialized in ${process.env.CASHFREE_ENV === 'PRODUCTION' ? 'PRODUCTION' : 'SANDBOX'} mode (API Version: ${cashfree.XApiVersion}). Client ID: ${cashfree.XClientId ? cashfree.XClientId.substring(0, 8) + '...' : 'None'}`);
 
 // Initialize Cloudinary SDK with sanitized environment variables
 cloudinary.config({
@@ -127,7 +127,12 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(express.json({ limit: '100mb' }));
+app.use(express.json({ 
+  limit: '100mb',
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString('utf8');
+  }
+}));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
 const PORT = process.env.PORT || 5000;
@@ -552,6 +557,15 @@ async function handleCreateCashfreeOrder(req, res) {
     const sanitizedPhone = String(customerPhone).replace(/\D/g, '').slice(-10) || '9999999999';
     const sanitizedCustomerId = String(finalUserId).replace(/[^a-zA-Z0-9_-]/g, '_');
 
+    const reqOrigin = req.headers.origin || (req.headers.referer ? new URL(req.headers.referer).origin : null);
+    const frontendBase = reqOrigin || process.env.APP_URL || 'https://myparva.com';
+    const cleanFrontendBase = frontendBase.replace(/\/+$/, '');
+    const returnUrl = `${cleanFrontendBase}/payment/return?order_id={order_id}`;
+
+    const backendBase = process.env.BACKEND_URL || (process.env.NODE_ENV === 'production' ? 'https://parava-backend.onrender.com' : 'http://localhost:5000');
+    // Cashfree PG rejects localhost notify_url; only pass notify_url if it is an external/https URL
+    const notifyUrl = backendBase.startsWith('http://localhost') ? undefined : `${backendBase.replace(/\/+$/, '')}/api/payments/cashfree/webhook`;
+
     const orderPayload = {
       order_id: orderId,
       order_amount: finalPayable,
@@ -563,28 +577,73 @@ async function handleCreateCashfreeOrder(req, res) {
         customer_phone: sanitizedPhone.length === 10 ? sanitizedPhone : '9999999999'
       },
       order_meta: {
-        return_url: `${process.env.APP_URL || 'https://parava-frontend.onrender.com'}/?order_id=${orderId}&status={payment_status}`,
-        notify_url: `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/payments/cashfree/webhook`
+        return_url: returnUrl,
+        ...(notifyUrl ? { notify_url: notifyUrl } : {})
       },
       order_note: `PARVA ${type.toUpperCase()} - ${vendorData?.name || vendorId || 'Service'} (Advance Booking Fee)`
     };
 
-    console.log(`[Cashfree] Creating order ${orderId} for ₹${finalPayable}...`);
+    console.log(`[PARVA_PAYMENT_CREATE] orderId=${orderId} userUid=${finalUserId} amount=${finalPayable} env=${process.env.CASHFREE_ENV || 'SANDBOX'}`);
     let orderData = null;
 
     try {
       const cfResponse = await cashfree.PGCreateOrder(orderPayload);
       orderData = cfResponse.data;
     } catch (cfErr) {
-      console.warn('[Cashfree Gateway Notice]:', cfErr?.response?.data || cfErr.message);
-      if (process.env.CASHFREE_ENV !== 'PRODUCTION') {
-        // In local/sandbox development when credentials are placeholder, generate sandbox session
-        orderData = {
-          order_id: orderId,
-          payment_session_id: `session_sandbox_${orderId}`
-        };
-      } else {
-        throw cfErr;
+      const errMsg = cfErr?.response?.data?.message || cfErr.message || 'Cashfree gateway error';
+      console.error(`[PARVA_PAYMENT_FAILED] orderId=${orderId} reason="${errMsg}"`);
+      return res.status(502).json({
+        success: false,
+        error: `Payment session could not be established: ${errMsg}. Please try again.`
+      });
+    }
+
+    if (!orderData || !orderData.payment_session_id) {
+      console.error(`[PARVA_PAYMENT_FAILED] orderId=${orderId} reason="Missing payment_session_id from Cashfree"`);
+      return res.status(502).json({
+        success: false,
+        error: 'Cashfree did not return an active payment session. Please retry.'
+      });
+    }
+
+    // Persist pending order draft for authoritative payment verification on return or webhook
+    if (db) {
+      try {
+        await db.collection('pending_orders').doc(orderId).set({
+          orderId,
+          userId: finalUserId,
+          customerUid: finalUserId,
+          vendorId: vendorId || vendorData?.id || 'system',
+          vendorName: vendorData?.name || 'Event Partner',
+          vendorCategory: vendorData?.category || 'Event Services',
+          vendorLocation: vendorData?.location || 'Maharashtra',
+          type,
+          selectedServices: selectedServices || [],
+          bundledItems: req.body.bundledItems || [],
+          planningGuestSize,
+          couponCode: couponCode || null,
+          customerDetails: {
+            name: customerName,
+            phone: sanitizedPhone,
+            email: req.user?.email || customerEmail,
+            age: req.body.customerAge || '',
+            address: req.body.eventLocationAddress || '',
+            coords: req.body.eventLocationCoords || null,
+            styleSuggestions: req.body.styleSuggestions || ''
+          },
+          eventDate,
+          eventTimeSlot,
+          servicesTotal,
+          rawBookingFee,
+          gstAmount,
+          couponDiscount,
+          finalPayable,
+          commissionData,
+          status: 'PENDING_PAYMENT',
+          createdAt: new Date().toISOString()
+        });
+      } catch (saveErr) {
+        console.warn(`[Cashfree Order] Note saving pending_orders draft for ${orderId}:`, saveErr.message);
       }
     }
 
@@ -617,6 +676,312 @@ app.post('/api/payments/cashfree/create-order', verifyAuth, handleCreateCashfree
 app.post('/api/payments/initiate', verifyAuth, handleCreateCashfreeOrder);
 
 /**
+ * Atomically confirms booking, transaction, slot reservation, receipt, emails, and notifications.
+ * Idempotent: Can be called safely from status check, verification endpoint, or webhook.
+ */
+async function confirmBookingAndTransaction(orderId, paymentRecord, customerUid, supplementalBookingData) {
+  const transactionId = `txn_${orderId}`;
+
+  // 1. Idempotency Check: If already processed, return existing confirmed booking & transaction
+  if (db) {
+    const existingTxn = await db.collection('transactions').doc(transactionId).get();
+    if (existingTxn.exists) {
+      console.log(`[PARVA_PAYMENT_CONFIRMED] (Idempotent Cache) orderId=${orderId}`);
+      let existingBookingDoc = await db.collection('bookings').doc(`b_${orderId}`).get();
+      let existingBookingData = existingBookingDoc.exists ? existingBookingDoc.data() : null;
+      if (!existingBookingData && supplementalBookingData?.id) {
+        const directDoc = await db.collection('bookings').doc(supplementalBookingData.id).get();
+        if (directDoc.exists) existingBookingData = directDoc.data();
+      }
+      if (!existingBookingData) {
+        const snap = await db.collection('bookings').where('orderId', '==', orderId).limit(1).get();
+        if (!snap.empty) existingBookingData = snap.docs[0].data();
+      }
+      return {
+        success: true,
+        idempotent: true,
+        transaction: existingTxn.data(),
+        booking: existingBookingData
+      };
+    }
+  }
+
+  // 2. Load draft from pending_orders if available
+  let pendingData = null;
+  if (db) {
+    try {
+      const pendingSnap = await db.collection('pending_orders').doc(orderId).get();
+      if (pendingSnap.exists) pendingData = pendingSnap.data();
+    } catch (e) {
+      console.warn(`[Confirm] Note loading pending_orders for ${orderId}:`, e.message);
+    }
+  }
+
+  const finalUserId = customerUid || pendingData?.userId || supplementalBookingData?.userId || 'guest-uid';
+  const effectiveVendorId = pendingData?.vendorId || supplementalBookingData?.vendorId || supplementalBookingData?.vendor?.id || 'system';
+
+  // Fetch Admin Settings
+  let commissionPct = 10;
+  let termsVersion = '1.2';
+  if (db) {
+    try {
+      const settingsDoc = await db.collection('settings').doc('global').get();
+      if (settingsDoc.exists) {
+        const sData = settingsDoc.data();
+        if (sData.commissionPercentage) commissionPct = Number(sData.commissionPercentage);
+        if (sData.termsVersion) termsVersion = sData.termsVersion || '1.2';
+      }
+    } catch (e) {}
+  }
+
+  const payableAmount = Number(paymentRecord?.payment_amount || pendingData?.finalPayable || supplementalBookingData?.finalPrice || 0);
+  const bookingSubtotal = Number(pendingData?.servicesTotal || supplementalBookingData?.totalPrice || payableAmount);
+  const bookingDiscount = Number(pendingData?.couponDiscount || supplementalBookingData?.bundleDiscount || 0);
+
+  const commissionData = calculateVendorCommission({
+    subtotal: bookingSubtotal,
+    discount: bookingDiscount,
+    commissionPercentage: commissionPct
+  });
+
+  // Authoritative real payment ID from Cashfree (NEVER fabricated)
+  const realPaymentId = paymentRecord?.cf_payment_id 
+    ? String(paymentRecord.cf_payment_id) 
+    : (paymentRecord?.payment_id ? String(paymentRecord.payment_id) : null);
+
+  const transactionData = {
+    id: transactionId,
+    provider: 'CASHFREE',
+    userId: finalUserId,
+    customerUid: finalUserId,
+    vendorId: effectiveVendorId,
+    type: pendingData?.type || supplementalBookingData?.type || 'booking',
+    orderId: orderId,
+    paymentId: realPaymentId,
+    totalAmount: payableAmount,
+    platformCommission: commissionData.platformCommission,
+    gstOnCommission: commissionData.gstOnCommission,
+    vendorPayout: commissionData.vendorPayout,
+    status: 'Paid',
+    termsVersion,
+    termsAcceptedAt: new Date().toISOString(),
+    timestamp: new Date().toISOString()
+  };
+
+  if (db) {
+    try {
+      await db.collection('transactions').doc(transactionId).set(transactionData);
+    } catch (dbErr) {
+      console.warn('[Firestore Transaction Warning]:', dbErr.message);
+    }
+  }
+
+  const bookingId = supplementalBookingData?.id || `b_${orderId}`;
+  const pricingSnapshot = {
+    subtotal: bookingSubtotal,
+    discount: bookingDiscount,
+    discountedSubtotal: Math.max(0, bookingSubtotal - bookingDiscount),
+    commissionPercentage: commissionPct,
+    commissionAmount: commissionData.platformCommission,
+    advanceAmount: payableAmount,
+    remainingAmount: Math.max(0, (bookingSubtotal - bookingDiscount) - Math.round(payableAmount / 1.18)),
+    vendorPayout: commissionData.vendorPayout,
+    finalPrice: bookingSubtotal - bookingDiscount
+  };
+
+  const customerName = supplementalBookingData?.customerName || pendingData?.customerDetails?.name || 'Valued Customer';
+  const customerEmail = supplementalBookingData?.customerEmail || pendingData?.customerDetails?.email || '';
+  const customerPhone = supplementalBookingData?.customerPhone || pendingData?.customerDetails?.phone || '';
+  const eventDate = supplementalBookingData?.eventDate || pendingData?.eventDate || '';
+  const eventTimeSlot = supplementalBookingData?.eventTimeSlot || pendingData?.eventTimeSlot || 'full_day';
+  const vendorName = supplementalBookingData?.vendor?.name || pendingData?.vendorName || 'Event Partner';
+  const vendorCategory = supplementalBookingData?.vendor?.category || pendingData?.vendorCategory || 'Event Services';
+  const vendorLocation = supplementalBookingData?.vendor?.location || pendingData?.vendorLocation || 'Maharashtra';
+
+  const confirmedBooking = {
+    ...(supplementalBookingData || {}),
+    id: bookingId,
+    userId: finalUserId,
+    customerUid: finalUserId,
+    customerName,
+    customerEmail,
+    customerPhone,
+    eventDate,
+    eventTimeSlot,
+    vendorId: effectiveVendorId,
+    vendor: supplementalBookingData?.vendor || {
+      id: effectiveVendorId,
+      name: vendorName,
+      category: vendorCategory,
+      location: vendorLocation
+    },
+    selectedServices: supplementalBookingData?.selectedServices || pendingData?.selectedServices || [],
+    provider: 'CASHFREE',
+    paymentStatus: 'Paid',
+    status: 'Confirmed',
+    transactionId,
+    paymentId: realPaymentId,
+    orderId: orderId,
+    totalPrice: bookingSubtotal,
+    finalPrice: pricingSnapshot.finalPrice,
+    pricing: pricingSnapshot,
+    commissionBreakdown: commissionData,
+    termsVersion,
+    termsAcceptedAt: new Date().toISOString(),
+    confirmedAt: new Date().toISOString()
+  };
+
+  if (db) {
+    try {
+      await db.collection('bookings').doc(bookingId).set(confirmedBooking, { merge: true });
+
+      // Mark pending_orders draft as CONFIRMED
+      await db.collection('pending_orders').doc(orderId).set({
+        status: 'CONFIRMED',
+        bookingId,
+        confirmedAt: new Date().toISOString()
+      }, { merge: true }).catch(() => {});
+    } catch (dbErr) {
+      console.warn('[Firestore Booking Write Warning]:', dbErr.message);
+    }
+
+    // Operational Telegram Alert
+    try {
+      telegramService.sendAlert(TELEGRAM_ALERT_TYPES.NEW_BOOKING, {
+        bookingId,
+        vendorName,
+        category: vendorCategory,
+        eventDate,
+        eventTimeSlot,
+        totalAmountINR: bookingSubtotal,
+        advancePaidINR: payableAmount
+      }).catch(tgErr => console.warn('[Telegram Alert Warning]:', tgErr.message));
+    } catch (tgEx) {}
+
+    // Double Booking Prevention: Append eventDate to vendor's busyDates
+    if (effectiveVendorId && eventDate) {
+      try {
+        const vRef = db.collection('vendors').doc(effectiveVendorId);
+        await vRef.update({
+          busyDates: admin.firestore.FieldValue.arrayUnion(eventDate)
+        }).catch(() => {});
+      } catch (lockErr) {}
+    }
+
+    // Lead Record
+    const leadId = `lead_${Date.now()}`;
+    await db.collection('leads').doc(leadId).set({
+      id: leadId,
+      bookingId,
+      vendorId: effectiveVendorId,
+      vendorName,
+      customerName,
+      customerPhone,
+      customerEmail,
+      eventDate,
+      eventType: supplementalBookingData?.eventType || 'Celebration',
+      amount: payableAmount,
+      status: 'Confirmed & Paid',
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    }).catch(() => {});
+
+    // PDF Receipt Generation
+    let pdfBuffer = null;
+    try {
+      pdfBuffer = await generateBookingPdf({
+        bookingId,
+        customerName,
+        customerPhone,
+        customerEmail,
+        vendorName,
+        vendorCategory,
+        vendorLocation,
+        serviceName: confirmedBooking.selectedServices?.[0]?.name || vendorCategory,
+        eventDate,
+        eventType: supplementalBookingData?.eventType || 'Celebration',
+        totalAmount: bookingSubtotal,
+        amountPaid: payableAmount,
+        paymentStatus: 'Paid',
+        paymentId: realPaymentId,
+        orderId,
+        termsVersion,
+        termsAcceptedAt: new Date().toISOString()
+      });
+    } catch (pdfErr) {
+      console.error('[Cashfree] PDF Generation Error:', pdfErr.message);
+    }
+
+    // Automated Resend Emails (Idempotent)
+    const customer = { name: customerName, email: customerEmail, phone: customerPhone };
+    const vendor = { name: vendorName, email: 'vendor@parvaevents.com', category: vendorCategory, location: vendorLocation };
+    sendPaymentAndBookingConfirmedEmails({
+      db,
+      booking: confirmedBooking,
+      customer,
+      vendor,
+      transaction: transactionData,
+      pdfBuffer,
+      commissionData
+    }).catch(err => console.error('[Cashfree] Email Automation Error:', err.message));
+
+    // Scoped & Idempotent Push / In-App Notifications
+    if (finalUserId && finalUserId !== 'Guest' && finalUserId !== 'guest-uid') {
+      await db.collection('notifications').doc(`notif_${bookingId}_customer`).set({
+        id: `notif_${bookingId}_customer`,
+        recipientUid: finalUserId,
+        bookingId,
+        vendorId: effectiveVendorId,
+        type: 'BOOKING_CONFIRMED',
+        title: `🎉 Booking Confirmed: #${bookingId}`,
+        message: `Your celebration service with ${vendorName} is confirmed for ${eventDate}. Receipt sent to your email!`,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        read: false
+      }, { merge: true }).catch(() => {});
+    }
+
+    if (effectiveVendorId) {
+      await db.collection('notifications').doc(`notif_${bookingId}_vendor`).set({
+        id: `notif_${bookingId}_vendor`,
+        recipientUid: effectiveVendorId,
+        bookingId,
+        vendorId: effectiveVendorId,
+        type: 'BOOKING_RECEIVED',
+        title: `🔔 New Booking Received: #${bookingId}`,
+        message: `New booking confirmed from ${customerName} for ${eventDate}. Advance paid: ₹${payableAmount}.`,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        read: false
+      }, { merge: true }).catch(() => {});
+    }
+
+    await db.collection('notifications').doc(`notif_${bookingId}_admin`).set({
+      id: `notif_${bookingId}_admin`,
+      recipientUid: 'admin',
+      bookingId,
+      vendorId: effectiveVendorId,
+      type: 'ADMIN_BOOKING_ALERT',
+      title: `💰 New Confirmed Booking: #${bookingId}`,
+      message: `Customer ${customerName} booked ${vendorName} for ₹${payableAmount}. Platform fee/commission: ₹${commissionData.platformCommission} (${commissionPct}%).`,
+      financial: {
+        grossAmount: payableAmount,
+        commissionPercentage: commissionPct,
+        commissionAmount: commissionData.platformCommission,
+        vendorPayout: commissionData.vendorPayout,
+        gatewayOrderId: orderId
+      },
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      read: false
+    }, { merge: true }).catch(() => {});
+  }
+
+  console.log(`[PARVA_PAYMENT_CONFIRMED] orderId=${orderId} bookingId=${bookingId}`);
+  return {
+    success: true,
+    transaction: transactionData,
+    booking: confirmedBooking
+  };
+}
+
+/**
  * Verifies Cashfree payment status server-side and atomically confirms booking
  */
 async function handleVerifyCashfreePayment(req, res) {
@@ -636,9 +1001,8 @@ async function handleVerifyCashfreePayment(req, res) {
       return res.status(400).json({ success: false, error: 'Order ID is required for verification.' });
     }
 
-    console.log(`[Cashfree] Verifying payment for Order ID: ${orderId}...`);
+    console.log(`[Cashfree Verify] Request for Order ID: ${orderId}...`);
 
-    // Verify authenticated customer token from request header if present
     let authenticatedCustomerUid = req.user?.uid || null;
     const authHeader = req.headers.authorization;
     if (!authenticatedCustomerUid && authHeader && authHeader.startsWith('Bearer ')) {
@@ -646,7 +1010,6 @@ async function handleVerifyCashfreePayment(req, res) {
       try {
         const decodedToken = await admin.auth().verifyIdToken(token);
         authenticatedCustomerUid = decodedToken.uid;
-        console.log(`[Cashfree Verify] Authenticated customer UID verified: ${authenticatedCustomerUid}`);
       } catch (authErr) {
         console.warn('[Cashfree Verify] Token verification notice:', authErr.message);
       }
@@ -662,7 +1025,7 @@ async function handleVerifyCashfreePayment(req, res) {
 
     try {
       const fetchResponse = await cashfree.PGOrderFetchPayments(orderId);
-      const payments = fetchResponse.data;
+      const payments = fetchResponse?.data || [];
 
       if (Array.isArray(payments) && payments.length > 0) {
         const successPayment = payments.find(p => p.payment_status === 'SUCCESS');
@@ -673,289 +1036,39 @@ async function handleVerifyCashfreePayment(req, res) {
       }
     } catch (cfErr) {
       console.warn(`[Cashfree API] PGOrderFetchPayments note:`, cfErr?.response?.data || cfErr.message);
-      // In sandbox mode with mock/simulated triggers, allow graceful pass if explicit paymentId is present
-      if (process.env.CASHFREE_ENV !== 'PRODUCTION' && paymentId) {
-        paymentVerified = true;
-        paymentDetails = { cf_payment_id: paymentId, payment_status: 'SUCCESS', payment_amount: totalAmount };
+    }
+
+    // Also check order status directly
+    if (!paymentVerified) {
+      try {
+        const orderRes = await cashfree.PGFetchOrder(orderId);
+        if (orderRes?.data?.order_status === 'PAID') {
+          paymentVerified = true;
+          paymentDetails = {
+            cf_payment_id: paymentId || orderRes.data.cf_order_id,
+            payment_amount: orderRes.data.order_amount,
+            payment_status: 'SUCCESS'
+          };
+        }
+      } catch (oErr) {
+        console.warn(`[Cashfree API] PGFetchOrder note:`, oErr?.response?.data || oErr.message);
       }
     }
 
     if (!paymentVerified) {
+      console.error(`[PARVA_PAYMENT_FAILED] orderId=${orderId} reason="Payment unconfirmed by Cashfree"`);
       return res.status(400).json({ 
         success: false, 
         error: 'Payment not verified by Cashfree Gateway. Status is unconfirmed.' 
       });
     }
 
-    // 2. Payment Idempotency Check: Prevent duplicate transactions & duplicate bookings
-    const transactionId = `txn_${orderId}`;
-    if (db) {
-      const existingTxn = await db.collection('transactions').doc(transactionId).get();
-      if (existingTxn.exists) {
-        console.log(`[Cashfree] Idempotency: Order ${orderId} already processed.`);
-        const existingBookingId = bookingData?.id || `b_${orderId}`;
-        let existingBookingDoc = await db.collection('bookings').doc(existingBookingId).get();
-        let existingBookingData = existingBookingDoc.exists ? existingBookingDoc.data() : null;
-        if (!existingBookingData) {
-          const snap = await db.collection('bookings').where('orderId', '==', orderId).limit(1).get();
-          if (!snap.empty) {
-            existingBookingData = snap.docs[0].data();
-          }
-        }
-        return res.json({ 
-          success: true, 
-          idempotent: true,
-          transaction: existingTxn.data(), 
-          booking: existingBookingData 
-        });
-      }
-    }
-
-    // 3. Fetch Admin Settings
-    let commissionPct = 10;
-    let termsVersion = '1.2';
-    if (db) {
-      try {
-        const settingsDoc = await db.collection('settings').doc('global').get();
-        if (settingsDoc.exists) {
-          const sData = settingsDoc.data();
-          if (sData.commissionPercentage) commissionPct = Number(sData.commissionPercentage);
-          if (sData.termsVersion) termsVersion = sData.termsVersion || '1.2';
-        }
-      } catch (e) { }
-    }
-
-    const payableAmount = Number(paymentDetails?.payment_amount || totalAmount || 0);
-    const bookingSubtotal = Number(bookingData?.totalPrice || bookingData?.pricing?.subtotal || payableAmount);
-    const bookingDiscount = Number(bookingData?.pricing?.discount || 0);
-
-    const commissionData = calculateVendorCommission({
-      subtotal: bookingSubtotal,
-      discount: bookingDiscount,
-      commissionPercentage: commissionPct
-    });
-
-    // 4. Save Authoritative Transaction
-    const transactionData = {
-      id: transactionId,
+    const result = await confirmBookingAndTransaction(orderId, paymentDetails, finalUserId, bookingData);
+    res.json({
+      success: true,
       provider: 'CASHFREE',
-      userId: finalUserId,
-      customerUid: finalUserId,
-      vendorId: vendorId || bookingData?.vendor?.id || 'System',
-      type: type || 'booking',
-      orderId: orderId,
-      paymentId: paymentDetails?.cf_payment_id || paymentId || `cf_pay_${Date.now()}`,
-      totalAmount: payableAmount,
-      platformCommission: commissionData.platformCommission,
-      gstOnCommission: commissionData.gstOnCommission,
-      vendorPayout: commissionData.vendorPayout,
-      status: 'Paid',
-      termsVersion,
-      termsAcceptedAt: new Date().toISOString(),
-      timestamp: new Date().toISOString()
-    };
-
-    if (db) {
-      await db.collection('transactions').doc(transactionId).set(transactionData);
-    }
-
-    // 5. Update / Confirm Booking Document with Immutable Pricing Snapshot
-    let confirmedBooking = null;
-    if (bookingData) {
-      const bookingId = bookingData.id || `b_${orderId}`;
-      const pricingSnapshot = bookingData.pricing || {
-        subtotal: bookingSubtotal,
-        discount: bookingDiscount,
-        discountedSubtotal: Math.max(0, bookingSubtotal - bookingDiscount),
-        commissionPercentage: commissionPct,
-        commissionAmount: commissionData.platformCommission,
-        advanceAmount: payableAmount,
-        remainingAmount: Math.max(0, (bookingSubtotal - bookingDiscount) - (payableAmount / 1.18)),
-        vendorPayout: commissionData.vendorPayout,
-        finalPrice: bookingSubtotal - bookingDiscount
-      };
-
-      confirmedBooking = {
-        ...bookingData,
-        id: bookingId,
-        userId: finalUserId,
-        customerUid: finalUserId,
-        provider: 'CASHFREE',
-        paymentStatus: 'Paid',
-        status: 'Confirmed',
-        transactionId,
-        paymentId: transactionData.paymentId,
-        orderId: orderId,
-        pricing: pricingSnapshot,
-        commissionBreakdown: commissionData,
-        termsVersion,
-        termsAcceptedAt: new Date().toISOString(),
-        confirmedAt: new Date().toISOString()
-      };
-
-      if (db) {
-        await db.collection('bookings').doc(bookingId).set(confirmedBooking, { merge: true });
-
-        // Trigger Operational Telegram Alert
-        try {
-          telegramService.sendAlert(TELEGRAM_ALERT_TYPES.NEW_BOOKING, {
-            bookingId,
-            vendorName: confirmedBooking.vendor?.name || 'Partner',
-            category: confirmedBooking.vendor?.category || 'Celebration',
-            eventDate: confirmedBooking.eventDate || 'N/A',
-            eventTimeSlot: confirmedBooking.eventTimeSlot || 'N/A',
-            totalAmountINR: confirmedBooking.totalPrice || pricingSnapshot.finalPrice || payableAmount,
-            advancePaidINR: payableAmount
-          }).catch(tgErr => console.warn('[Telegram Alert Warning]:', tgErr.message));
-        } catch (tgEx) {
-          console.warn('[Telegram Exception]:', tgEx);
-        }
-
-        // Double Booking Prevention: Atomically append event date to vendor's busyDates
-        if (bookingData.vendor?.id && bookingData.eventDate) {
-          try {
-            const vRef = db.collection('vendors').doc(bookingData.vendor.id);
-            const vSnap = await vRef.get();
-            if (vSnap.exists) {
-              const currentBusy = vSnap.data().busyDates || [];
-              if (!currentBusy.includes(bookingData.eventDate)) {
-                await vRef.update({
-                  busyDates: admin.firestore.FieldValue.arrayUnion(bookingData.eventDate)
-                });
-                console.log(`[Slot Lock] Locked date ${bookingData.eventDate} for vendor ${bookingData.vendor.id}`);
-              }
-            }
-          } catch (lockErr) {
-            console.warn('[Slot Lock] Note updating busyDates:', lockErr);
-          }
-        }
-
-        // Create Lead Record
-        const leadId = `lead_${Date.now()}`;
-        await db.collection('leads').doc(leadId).set({
-          id: leadId,
-          bookingId,
-          vendorId: bookingData.vendor?.id || vendorId,
-          vendorName: bookingData.vendor?.name || 'Event Partner',
-          customerName: customerData?.name || bookingData.customerName || 'Valued Customer',
-          customerPhone: customerData?.phone || bookingData.customerPhone || 'N/A',
-          customerEmail: customerData?.email || bookingData.customerEmail || 'N/A',
-          eventDate: bookingData.eventDate || '',
-          eventType: bookingData.eventType || 'Celebration',
-          amount: payableAmount,
-          status: 'Confirmed & Paid',
-          createdAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        // Generate Official Vector PDF Receipt
-        let pdfBuffer = null;
-        try {
-          pdfBuffer = await generateBookingPdf({
-            bookingId,
-            customerName: customerData?.name || bookingData.customerName || 'Valued Customer',
-            customerPhone: customerData?.phone || bookingData.customerPhone || 'N/A',
-            customerEmail: customerData?.email || bookingData.customerEmail || 'N/A',
-            vendorName: bookingData.vendor?.name || 'Event Partner',
-            vendorCategory: bookingData.vendor?.category || 'Event Services',
-            vendorLocation: bookingData.vendor?.location || 'Maharashtra',
-            serviceName: bookingData.selectedServices?.[0]?.name || bookingData.vendor?.category || 'Event Package',
-            eventDate: bookingData.eventDate,
-            eventType: bookingData.eventType || 'Celebration',
-            totalAmount: Number(bookingData.totalPrice || payableAmount),
-            amountPaid: payableAmount,
-            paymentStatus: 'Paid',
-            paymentId: transactionData.paymentId,
-            orderId: orderId,
-            termsVersion,
-            termsAcceptedAt: new Date().toISOString()
-          });
-        } catch (pdfErr) {
-          console.error('[Cashfree] PDF Generation Error:', pdfErr);
-        }
-
-        // Automated Resend Emails (Idempotent)
-        const customer = {
-          name: customerData?.name || bookingData.customerName || 'Valued Customer',
-          email: customerData?.email || bookingData.customerEmail,
-          phone: customerData?.phone || bookingData.customerPhone
-        };
-
-        const vendor = {
-          name: bookingData.vendor?.name || 'Event Partner',
-          email: bookingData.vendor?.email || 'vendor@parvaevents.com',
-          category: bookingData.vendor?.category || 'Event Services',
-          location: bookingData.vendor?.location || 'Maharashtra'
-        };
-
-        sendPaymentAndBookingConfirmedEmails({
-          db,
-          booking: confirmedBooking,
-          customer,
-          vendor,
-          transaction: transactionData,
-          pdfBuffer,
-          commissionData
-        }).catch(err => console.error('[Cashfree] Email Automation Error:', err));
-
-        // Scoped & Idempotent Push / In-App Notifications
-        const customerUid = finalUserId;
-        if (customerUid && customerUid !== 'Guest' && customerUid !== 'guest-uid') {
-          await db.collection('notifications').doc(`notif_${bookingId}_customer`).set({
-            id: `notif_${bookingId}_customer`,
-            recipientUid: customerUid,
-            bookingId,
-            vendorId: bookingData.vendor?.id || vendorId,
-            type: 'BOOKING_CONFIRMED',
-            title: `🎉 Booking Confirmed: #${bookingId}`,
-            message: `Your celebration service with ${bookingData.vendor?.name || 'Vendor'} is confirmed for ${bookingData.eventDate}. Receipt sent to your email!`,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            read: false
-          }, { merge: true });
-        }
-
-        const vendorUid = bookingData.vendor?.id || vendorId;
-        if (vendorUid) {
-          await db.collection('notifications').doc(`notif_${bookingId}_vendor`).set({
-            id: `notif_${bookingId}_vendor`,
-            recipientUid: vendorUid,
-            bookingId,
-            vendorId: vendorUid,
-            type: 'BOOKING_RECEIVED',
-            title: `🔔 New Booking Received: #${bookingId}`,
-            message: `New booking confirmed from ${customer.name} for ${bookingData.eventDate}. Advance paid: ₹${payableAmount}.`,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            read: false
-          }, { merge: true });
-        }
-
-        // Operational Admin Financial Notification
-        await db.collection('notifications').doc(`notif_${bookingId}_admin`).set({
-          id: `notif_${bookingId}_admin`,
-          recipientUid: 'admin',
-          bookingId,
-          vendorId: bookingData.vendor?.id || vendorId,
-          type: 'ADMIN_BOOKING_ALERT',
-          title: `💰 New Confirmed Booking: #${bookingId}`,
-          message: `Customer ${customer.name} booked ${vendor.name} for ₹${payableAmount}. Platform fee/commission: ₹${commissionData.platformCommission} (${commissionPct}%).`,
-          financial: {
-            grossAmount: payableAmount,
-            commissionPercentage: commissionPct,
-            commissionAmount: commissionData.platformCommission,
-            vendorPayout: commissionData.vendorPayout,
-            gatewayOrderId: orderId
-          },
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          read: false
-        }, { merge: true });
-      }
-    }
-
-    console.log(`[Cashfree] Payment verified & confirmed for order ${orderId}!`);
-    res.json({ 
-      success: true, 
-      provider: 'CASHFREE',
-      transaction: transactionData, 
-      booking: confirmedBooking 
+      transaction: result.transaction,
+      booking: result.booking
     });
   } catch (error) {
     console.error('[Cashfree] Verification Error:', error);
@@ -963,20 +1076,144 @@ async function handleVerifyCashfreePayment(req, res) {
   }
 }
 
-// Register both /api/payments/cashfree/verify and /api/payments/verify with strict authentication
+/**
+ * Dedicated Status Endpoint: GET/POST /api/payments/cashfree/status?orderId=XXXX
+ * Authoritatively queries Cashfree, confirms booking if SUCCESS, and returns verified state.
+ */
+async function handleGetCashfreeOrderStatus(req, res) {
+  try {
+    const orderId = req.query.orderId || req.body.orderId;
+    if (!orderId) {
+      return res.status(400).json({ success: false, error: 'orderId parameter is required' });
+    }
+
+    console.log(`[PARVA_PAYMENT_RETURN] orderId=${orderId}`);
+
+    // 1. Check idempotency: If already confirmed in Firestore, return immediately
+    const transactionId = `txn_${orderId}`;
+    if (db) {
+      try {
+        const existingTxn = await db.collection('transactions').doc(transactionId).get();
+        if (existingTxn.exists) {
+          let bookingDoc = await db.collection('bookings').doc(`b_${orderId}`).get();
+          let bookingData = bookingDoc.exists ? bookingDoc.data() : null;
+          if (!bookingData) {
+            const snap = await db.collection('bookings').where('orderId', '==', orderId).limit(1).get();
+            if (!snap.empty) bookingData = snap.docs[0].data();
+          }
+          console.log(`[PARVA_PAYMENT_STATUS] orderId=${orderId} cashfreeStatus=SUCCESS (cached)`);
+          return res.json({
+            success: true,
+            status: 'SUCCESS',
+            orderId,
+            transaction: existingTxn.data(),
+            booking: bookingData
+          });
+        }
+      } catch (dbErr) {
+        console.warn(`[Firestore Status Notice]:`, dbErr.message);
+      }
+    }
+
+    // 2. Query Cashfree Payments directly
+    let payments = [];
+    let cfOrder = null;
+    try {
+      const fetchResponse = await cashfree.PGOrderFetchPayments(orderId);
+      payments = fetchResponse?.data || [];
+    } catch (cfErr) {
+      console.warn(`[Cashfree API] PGOrderFetchPayments warning for ${orderId}:`, cfErr?.response?.data || cfErr.message);
+    }
+
+    try {
+      const oRes = await cashfree.PGFetchOrder(orderId);
+      cfOrder = oRes?.data;
+    } catch (cfErr) {
+      console.warn(`[Cashfree API] PGFetchOrder warning for ${orderId}:`, cfErr?.response?.data || cfErr.message);
+    }
+
+    // 3. Evaluate payment status
+    const successPayment = Array.isArray(payments) ? payments.find(p => p.payment_status === 'SUCCESS') : null;
+    const isSuccess = Boolean(successPayment) || cfOrder?.order_status === 'PAID';
+
+    if (isSuccess) {
+      console.log(`[PARVA_PAYMENT_STATUS] orderId=${orderId} cashfreeStatus=SUCCESS`);
+      const paymentRecord = successPayment || {
+        cf_payment_id: cfOrder?.cf_order_id || null,
+        payment_amount: cfOrder?.order_amount || 0,
+        payment_status: 'SUCCESS'
+      };
+      const result = await confirmBookingAndTransaction(orderId, paymentRecord, req.user?.uid || null, null);
+      return res.json({
+        success: true,
+        status: 'SUCCESS',
+        orderId,
+        transaction: result.transaction,
+        booking: result.booking
+      });
+    }
+
+    const pendingPayment = Array.isArray(payments) ? payments.find(p => p.payment_status === 'PENDING') : null;
+    if (pendingPayment || cfOrder?.order_status === 'ACTIVE') {
+      console.log(`[PARVA_PAYMENT_STATUS] orderId=${orderId} cashfreeStatus=PENDING`);
+      return res.json({
+        success: true,
+        status: 'PENDING',
+        orderId,
+        message: 'Payment is being processed by your bank. Please do not pay again.'
+      });
+    }
+
+    if (cfOrder?.order_status === 'EXPIRED') {
+      console.log(`[PARVA_PAYMENT_STATUS] orderId=${orderId} cashfreeStatus=EXPIRED`);
+      return res.json({
+        success: false,
+        status: 'EXPIRED',
+        orderId,
+        message: 'Payment session expired. Please start a new checkout.'
+      });
+    }
+
+    const failedPayment = Array.isArray(payments) ? payments.find(p => p.payment_status === 'FAILED' || p.payment_status === 'USER_DROPPED' || p.payment_status === 'CANCELLED') : null;
+    if (failedPayment) {
+      console.log(`[PARVA_PAYMENT_STATUS] orderId=${orderId} cashfreeStatus=${failedPayment.payment_status}`);
+      return res.json({
+        success: false,
+        status: failedPayment.payment_status === 'USER_DROPPED' ? 'CANCELLED' : 'FAILED',
+        orderId,
+        message: failedPayment.payment_message || 'Payment was cancelled or failed.'
+      });
+    }
+
+    console.log(`[PARVA_PAYMENT_STATUS] orderId=${orderId} cashfreeStatus=UNKNOWN`);
+    return res.json({
+      success: false,
+      status: 'UNKNOWN',
+      orderId,
+      message: 'Payment status could not be determined. Please check My Bookings shortly.'
+    });
+  } catch (error) {
+    console.error(`[PARVA_PAYMENT_FAILED] orderId=${req.query?.orderId || req.body?.orderId} reason="${error.message}"`);
+    res.status(500).json({ success: false, error: 'Error checking payment status.' });
+  }
+}
+
+// Register Payment Status and Verification Routes
+app.get('/api/payments/cashfree/status', verifyOptionalAuth, handleGetCashfreeOrderStatus);
+app.post('/api/payments/cashfree/status', verifyOptionalAuth, handleGetCashfreeOrderStatus);
 app.post('/api/payments/cashfree/verify', verifyAuth, handleVerifyCashfreePayment);
 app.post('/api/payments/verify', verifyAuth, handleVerifyCashfreePayment);
 
 // ==================== CASHFREE WEBHOOK LISTENER ====================
 app.post('/api/payments/cashfree/webhook', async (req, res) => {
   try {
-    const rawBody = JSON.stringify(req.body);
+    const rawBody = req.rawBody || JSON.stringify(req.body);
     const signature = req.headers['x-webhook-signature'];
     const timestamp = req.headers['x-webhook-timestamp'];
 
     console.log(`[Cashfree Webhook] Received webhook notification.`);
 
-    // Verify Webhook Signature if signature header is provided
+    // Cryptographic signature verification using unaltered rawBody
     if (signature && timestamp) {
       try {
         cashfree.PGVerifyWebhookSignature(signature, rawBody, timestamp);
@@ -986,37 +1223,16 @@ app.post('/api/payments/cashfree/webhook', async (req, res) => {
     }
 
     const { type, data } = req.body;
+    console.log(`[PARVA_PAYMENT_WEBHOOK] orderId=${data?.order?.order_id || 'N/A'} eventType=${type}`);
 
     if (type === 'PAYMENT_SUCCESS_WEBHOOK' && data?.order?.order_id) {
       const orderId = data.order.order_id;
-      console.log(`[Cashfree Webhook] Processing PAYMENT_SUCCESS for order: ${orderId}`);
-
-      const transactionId = `txn_${orderId}`;
-      if (db) {
-        const existingTxn = await db.collection('transactions').doc(transactionId).get();
-        if (!existingTxn.exists) {
-          await db.collection('transactions').doc(transactionId).set({
-            id: transactionId,
-            provider: 'CASHFREE',
-            orderId: orderId,
-            paymentId: data.payment?.cf_payment_id || `cf_hook_${Date.now()}`,
-            totalAmount: Number(data.order?.order_amount || 0),
-            status: 'Paid',
-            source: 'webhook',
-            timestamp: new Date().toISOString()
-          });
-
-          // Confirm any pending booking matching orderId
-          const snap = await db.collection('bookings').where('orderId', '==', orderId).get();
-          snap.forEach(async (docSnap) => {
-            await docSnap.ref.update({
-              status: 'Confirmed',
-              paymentStatus: 'Paid',
-              confirmedAt: new Date().toISOString()
-            });
-          });
-        }
-      }
+      const paymentRecord = {
+        cf_payment_id: data.payment?.cf_payment_id || null,
+        payment_amount: Number(data.order?.order_amount || data.payment?.payment_amount || 0),
+        payment_status: 'SUCCESS'
+      };
+      await confirmBookingAndTransaction(orderId, paymentRecord, data.customer_details?.customer_id || null, null);
     }
 
     res.status(200).json({ status: 'OK' });
