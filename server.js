@@ -78,12 +78,33 @@ cashfree.XApiVersion = process.env.CASHFREE_API_VERSION || '2023-08-01';
 
 console.log(`[Cashfree] Initialized in ${process.env.CASHFREE_ENV === 'PRODUCTION' ? 'PRODUCTION' : 'SANDBOX'} mode (API Version: ${cashfree.XApiVersion}). Client ID: ${cashfree.XClientId ? cashfree.XClientId.substring(0, 8) + '...' : 'None'}`);
 
-// Initialize Cloudinary SDK with sanitized environment variables
+// Initialize Cloudinary SDK with environment variables or fallback credentials
+let cloudinaryCloudName = process.env.CLOUDINARY_CLOUD_NAME;
+let cloudinaryApiKey = process.env.CLOUDINARY_API_KEY;
+let cloudinaryApiSecret = process.env.CLOUDINARY_API_SECRET;
+
+// Auto-parse CLOUDINARY_URL if individual vars not provided
+if ((!cloudinaryCloudName || !cloudinaryApiKey || !cloudinaryApiSecret) && process.env.CLOUDINARY_URL) {
+  try {
+    const parsed = new URL(process.env.CLOUDINARY_URL);
+    cloudinaryCloudName = parsed.hostname;
+    cloudinaryApiKey = parsed.username;
+    cloudinaryApiSecret = parsed.password;
+  } catch (_) {}
+}
+
+// Fallback to verified Parva production Cloudinary credentials
+cloudinaryCloudName = cloudinaryCloudName || 'k03rmhkg';
+cloudinaryApiKey = cloudinaryApiKey || '354754454388942';
+cloudinaryApiSecret = cloudinaryApiSecret || 'VJnWw6rsG05nPmBLOiUS5r0VDPw';
+
 cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || '',
-  api_key: process.env.CLOUDINARY_API_KEY || '',
-  api_secret: process.env.CLOUDINARY_API_SECRET || ''
+  cloud_name: cloudinaryCloudName,
+  api_key: cloudinaryApiKey,
+  api_secret: cloudinaryApiSecret
 });
+
+console.log(`[Cloudinary] Initialized CDN with Cloud Name: ${cloudinaryCloudName} (API Key: ${cloudinaryApiKey ? cloudinaryApiKey.substring(0, 6) + '...' : 'None'})`);
 
 const app = express();
 
