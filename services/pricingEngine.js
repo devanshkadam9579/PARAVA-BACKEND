@@ -11,6 +11,8 @@
  * - Immutable price snapshot creation for historical integrity
  */
 
+import crypto from 'crypto';
+
 export const PRICING_MODELS = {
   PER_GUEST: 'PER_GUEST',
   PER_PLATE: 'PER_PLATE',
@@ -263,4 +265,218 @@ export function calculateBookingPrice({
   };
 
   return priceSnapshot;
+}
+
+/**
+ * Authoritative Master Multi-Item / Multi-Vendor Cart Price & Quote Calculator
+ * 
+ * Rules:
+ * - Deterministic integer paise arithmetic across all lines and totals
+ * - Every cart line preserves vendorId, serviceId, packageId, guestCount, quantity, duration
+ * - Single application of guest count to unit plate rate for catering
+ * - Coupon applied to subtotal once, capping discount safely
+ * - Multi-vendor breakdown with proportionate discounting and vendor net payout
+ * - Produces an immutable, time-bounded quote with quoteId and expiresAt
+ * 
+ * @param {Object} params
+ * @param {Array}  params.cartItems - Array of { vendor, service, selectedPackage, selectedAddons, guestCount, quantity, extraHours, durationDays, eventDate, eventTimeSlot }
+ * @param {Object} [params.coupon] - Optional validated coupon from DB
+ * @param {number} [params.commissionPercentage=10] - Dynamic admin commission %
+ * @param {number} [params.bookingFeePercentage=5] - Dynamic advance booking fee %
+ * @param {string} [params.currency='INR']
+ * @returns {Object} Structured authoritative quote & price snapshot
+ */
+export function calculateCartQuote({
+  cartItems = [],
+  coupon = null,
+  commissionPercentage = 10,
+  bookingFeePercentage = 5,
+  currency = 'INR'
+}) {
+  if (!Array.isArray(cartItems) || cartItems.length === 0) {
+    throw new Error('CART_EMPTY: Cart must contain at least one item.');
+  }
+
+  const items = [];
+  let cartSubtotalPaise = 0;
+  const primaryCategory = cartItems[0]?.vendor?.category || 'General';
+
+  for (const item of cartItems) {
+    const vendor = item.vendor || {};
+    const service = item.service || {};
+    const category = (vendor.category || '').trim();
+    const isCatering = category.toLowerCase().includes('cater');
+    const rawModel = (service.pricingModel || service.pricingType || '').toUpperCase();
+    const pricingModel = rawModel || (isCatering ? PRICING_MODELS.PER_GUEST : PRICING_MODELS.PACKAGE_PLUS_ADDONS);
+
+    const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
+    let lineBasePaise = 0;
+    let lineDurationPaise = 0;
+    let lineAddonsPaise = 0;
+    let unitPriceINR = 0;
+    let appliedGuestCount = null;
+
+    if (pricingModel === PRICING_MODELS.PER_GUEST || pricingModel === PRICING_MODELS.PER_PLATE || isCatering) {
+      const guests = validateGuestCount(service, item.guestCount || 100);
+      appliedGuestCount = guests;
+      // Unit plate rate: never pre-multiplied
+      unitPriceINR = Number(
+        item.basePlatePrice || 
+        service.basePlatePrice || 
+        item.selectedPackage?.price || 
+        service.basePrice || 
+        service.price || 
+        500
+      );
+      // Guard: If service.price was mistakenly sent as total extended price (> 2500 and basePlatePrice exists), use basePlatePrice
+      if (service.basePlatePrice && unitPriceINR === service.price && service.price > 2500) {
+        unitPriceINR = Number(service.basePlatePrice);
+      }
+      lineBasePaise = Math.round(unitPriceINR * 100) * guests * qty;
+    } else if (pricingModel === PRICING_MODELS.HOURLY) {
+      unitPriceINR = Number(item.selectedPackage?.price || service.basePrice || service.price || 15000);
+      lineBasePaise = Math.round(unitPriceINR * 100) * qty;
+      const hourlyRateINR = Number(service.hourlyRate || 2000);
+      const extraHours = Math.max(0, parseInt(item.extraHours, 10) || 0);
+      lineDurationPaise = Math.round(hourlyRateINR * 100) * extraHours;
+    } else if (pricingModel === PRICING_MODELS.PER_DAY) {
+      unitPriceINR = Number(item.selectedPackage?.price || service.basePrice || service.price || 20000);
+      const days = Math.max(1, parseInt(item.durationDays, 10) || 1);
+      lineBasePaise = Math.round(unitPriceINR * 100) * days * qty;
+    } else {
+      unitPriceINR = Number(item.selectedPackage?.price || service.basePrice || service.price || 10000);
+      lineBasePaise = Math.round(unitPriceINR * 100) * qty;
+    }
+
+    if (Array.isArray(item.selectedAddons) && item.selectedAddons.length > 0) {
+      lineAddonsPaise = item.selectedAddons.reduce((sum, addon) => {
+        return sum + Math.round(Number(addon.price || 0) * 100);
+      }, 0);
+    }
+
+    const itemSubtotalPaise = lineBasePaise + lineDurationPaise + lineAddonsPaise;
+    cartSubtotalPaise += itemSubtotalPaise;
+
+    items.push({
+      vendorId: vendor.id || item.vendorId || 'system',
+      vendorName: vendor.name || 'Parva Partner',
+      vendorCategory: category || 'General',
+      serviceId: service.id || service.name || 'svc',
+      serviceName: service.name || 'Service Package',
+      pricingModel,
+      unitPrice: unitPriceINR,
+      quantity: qty,
+      guestCount: appliedGuestCount,
+      extraHours: item.extraHours ? parseInt(item.extraHours, 10) : undefined,
+      durationDays: item.durationDays ? parseInt(item.durationDays, 10) : undefined,
+      selectedPackage: item.selectedPackage || null,
+      selectedAddons: item.selectedAddons || [],
+      eventDate: item.eventDate || '',
+      eventTimeSlot: item.eventTimeSlot || 'evening',
+      lineSubtotal: itemSubtotalPaise / 100,
+      _paise: {
+        lineBasePaise,
+        lineDurationPaise,
+        lineAddonsPaise,
+        itemSubtotalPaise
+      }
+    });
+  }
+
+  // Coupon evaluation
+  const couponResult = evaluateCoupon(coupon, cartSubtotalPaise, primaryCategory);
+  const discountPaise = couponResult.discountPaise;
+  const discountedSubtotalPaise = Math.max(0, cartSubtotalPaise - discountPaise);
+
+  // Platform fee (e.g. 5%) and GST (18% on platform fee)
+  const feePct = Number(bookingFeePercentage) > 0 ? Number(bookingFeePercentage) : 5;
+  const platformFeePaise = Math.round((discountedSubtotalPaise * feePct) / 100);
+  const taxGstPaise = Math.round(platformFeePaise * 0.18);
+  const finalAdvanceDuePaise = platformFeePaise + taxGstPaise;
+  const balanceDueAtEventPaise = discountedSubtotalPaise - platformFeePaise;
+
+  // Vendor breakdowns (for multi-vendor reconcile)
+  const commPct = Number(commissionPercentage) >= 0 ? Number(commissionPercentage) : 10;
+  const vendorBreakdowns = {};
+
+  for (const item of items) {
+    const vId = item.vendorId;
+    if (!vendorBreakdowns[vId]) {
+      vendorBreakdowns[vId] = {
+        vendorId: vId,
+        vendorName: item.vendorName,
+        vendorCategory: item.vendorCategory,
+        itemsSubtotalPaise: 0,
+        discountPaise: 0,
+        discountedSubtotalPaise: 0,
+        commissionAmountPaise: 0,
+        vendorPayoutPaise: 0
+      };
+    }
+    vendorBreakdowns[vId].itemsSubtotalPaise += item._paise.itemSubtotalPaise;
+  }
+
+  // Allocate coupon discount proportionally across vendors
+  for (const vId of Object.keys(vendorBreakdowns)) {
+    const v = vendorBreakdowns[vId];
+    const vProportion = cartSubtotalPaise > 0 ? v.itemsSubtotalPaise / cartSubtotalPaise : 0;
+    v.discountPaise = Math.round(discountPaise * vProportion);
+    v.discountedSubtotalPaise = Math.max(0, v.itemsSubtotalPaise - v.discountPaise);
+    v.commissionAmountPaise = Math.round((v.discountedSubtotalPaise * commPct) / 100);
+    v.vendorPayoutPaise = Math.max(0, v.discountedSubtotalPaise - v.commissionAmountPaise);
+
+    v.itemsSubtotal = v.itemsSubtotalPaise / 100;
+    v.discount = v.discountPaise / 100;
+    v.discountedSubtotal = v.discountedSubtotalPaise / 100;
+    v.commissionAmount = v.commissionAmountPaise / 100;
+    v.vendorPayout = v.vendorPayoutPaise / 100;
+  }
+
+  const quoteId = `q_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const quoteExpiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+  return {
+    quoteId,
+    expiresAt: quoteExpiresAt,
+    currency,
+    items,
+    itemCount: items.length,
+    vendorCount: Object.keys(vendorBreakdowns).length,
+    vendorBreakdowns: Object.values(vendorBreakdowns),
+
+    // Authoritative totals in INR
+    subtotal: cartSubtotalPaise / 100,
+    servicesTotal: cartSubtotalPaise / 100,
+    couponCode: couponResult.valid ? couponResult.code : null,
+    discount: discountPaise / 100,
+    couponDiscount: discountPaise / 100,
+    discountedSubtotal: discountedSubtotalPaise / 100,
+    totalOrderValue: discountedSubtotalPaise / 100,
+    finalPrice: discountedSubtotalPaise / 100,
+
+    bookingFeePercentage: feePct,
+    platformFee: platformFeePaise / 100,
+    bookingFee: platformFeePaise / 100,
+    taxGst: taxGstPaise / 100,
+    tax: taxGstPaise / 100,
+
+    finalAdvanceDue: finalAdvanceDuePaise / 100,
+    advanceAmount: finalAdvanceDuePaise / 100,
+    customerPayableNow: finalAdvanceDuePaise / 100,
+    remainingAmount: balanceDueAtEventPaise / 100,
+    balanceDueAtEvent: balanceDueAtEventPaise / 100,
+
+    commissionPercentage: commPct,
+    commissionAmount: Math.round((discountedSubtotalPaise * commPct) / 100) / 100,
+
+    _paise: {
+      subtotalPaise: cartSubtotalPaise,
+      discountPaise,
+      discountedSubtotalPaise,
+      platformFeePaise,
+      taxGstPaise,
+      finalAdvanceDuePaise,
+      balanceDueAtEventPaise
+    }
+  };
 }

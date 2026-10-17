@@ -106,18 +106,23 @@ if (quote8.commissionAmount === 720 && quote8.vendorPayout === 8280) {
 
 // 4. Availability Test
 console.log('\n----------------------------------------------------');
-console.log('Test 4: Real Vendor Availability (Busy on 2026-09-18)');
+const now = new Date();
+const futureBusyDate = new Date(now.getTime() + 5 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+const futureFreeDate = new Date(now.getTime() + 10 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+mockVendor.busyDates = [futureBusyDate];
+
+console.log(`Test 4: Real Vendor Availability (Busy on ${futureBusyDate})`);
 const availBusy = checkAvailability({
   vendor: mockVendor,
-  eventDate: '2026-09-18'
+  eventDate: futureBusyDate
 });
-console.log('2026-09-18 status:', availBusy.available ? 'AVAILABLE' : 'UNAVAILABLE (Blocked)');
+console.log(`${futureBusyDate} status:`, availBusy.available ? 'AVAILABLE' : 'UNAVAILABLE (Blocked)');
 
 const availFree = checkAvailability({
   vendor: mockVendor,
-  eventDate: '2026-09-22'
+  eventDate: futureFreeDate
 });
-console.log('2026-09-22 status:', availFree.available ? 'AVAILABLE' : 'UNAVAILABLE');
+console.log(`${futureFreeDate} status:`, availFree.available ? 'AVAILABLE' : 'UNAVAILABLE');
 
 if (!availBusy.available && availFree.available) {
   console.log('✅ Test 4 PASSED: Vendor availability correctly respects real busy dates.');
